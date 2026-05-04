@@ -1,0 +1,327 @@
+"""Rich Live display for teammate status.
+
+This provides real-time visualization of running agents in the REPL,
+similar to TypeScript's TeammateSpinnerTree component.
+
+Usage:
+    from claude_code_py.utils.rich_status_display import TeammateStatusDisplay
+
+    display = TeammateStatusDisplay(get_app_state, set_app_state)
+    display.start()
+
+    # ... REPL loop runs ...
+
+    display.stop()
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from typing import Any, Callable, Optional
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
+from rich.panel import Panel
+
+
+# Color mapping (matching TypeScript spinner colors)
+COLOR_MAP = {
+    "green": "green",
+    "blue": "blue",
+    "yellow": "yellow",
+    "red": "red",
+    "magenta": "magenta",
+    "cyan": "cyan",
+    "white": "white",
+    "orange": "orange3",
+    "purple": "purple",
+    "pink": "pink",
+}
+
+# Spinner characters (cycling animation)
+SPINNER_CHARS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+# Default verbs for different states
+DEFAULT_VERBS = {
+    "thinking": "thinking",
+    "reading": "reading files",
+    "writing": "writing code",
+    "tool_call": "using tools",
+    "waiting": "waiting",
+    "idle": "idle",
+    "default": "working",
+}
+
+
+class TeammateStatusDisplay:
+    """Real-time display of running teammate agents.
+
+    Uses Rich Live to show a status table that updates periodically.
+    Runs in a background thread to avoid blocking the main REPL loop.
+    """
+
+    def __init__(
+        self,
+        get_app_state: Callable[[], Any],
+        set_app_state: Callable[[Callable[[Any], Any]], None],
+        refresh_per_second: int = 4,
+        console: Optional[Console] = None,
+    ):
+        """Initialize the status display.
+
+        Args:
+            get_app_state: Function to get current AppState
+            set_app_state: Function to update AppState
+            refresh_per_second: How often to refresh display
+            console: Optional Rich Console (creates new if None)
+        """
+        self._get_app_state = get_app_state
+        self._set_app_state = set_app_state
+        self._refresh_rate = refresh_per_second
+        self._console = console or Console()
+
+        self._live: Optional[Live] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._spinner_index = 0
+
+    def start(self) -> None:
+        """Start the status display in background thread."""
+        if self._running:
+            return
+
+        self._running = True
+
+        def run_display():
+            """Run Rich Live display in dedicated thread."""
+            try:
+                # Create Live display
+                self._live = Live(
+                    self._generate_table(),
+                    console=self._console,
+                    refresh_per_second=self._refresh_rate,
+                    transient=True,  # Clear when done
+                    vertical_overflow="visible",
+                )
+                self._live.start()
+
+                # Keep updating while running
+                while self._running:
+                    self._spinner_index = (self._spinner_index + 1) % len(SPINNER_CHARS)
+                    if self._live:
+                        self._live.update(self._generate_table())
+                    time.sleep(1.0 / self._refresh_rate)
+
+            except Exception:
+                pass  # Silently exit on errors
+
+            finally:
+                if self._live:
+                    try:
+                        self._live.stop()
+                    except Exception:
+                        pass
+
+        self._thread = threading.Thread(
+            target=run_display,
+            name="teammate-status-display",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the status display."""
+        self._running = False
+
+        if self._live:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def pause(self) -> None:
+        """Pause the display temporarily (e.g., while waiting for input).
+
+        This stops the Live display without stopping the background thread,
+        allowing normal Console output to appear without interference.
+        """
+        if self._live and self._running:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+
+    def resume(self) -> None:
+        """Resume the display after pausing.
+
+        Restart the Live display to show teammate status again.
+        """
+        if self._live and self._running:
+            try:
+                self._live.start()
+            except Exception:
+                pass
+
+    def _generate_table(self) -> Panel:
+        """Generate the status display table.
+
+        Returns:
+            Rich Panel containing the status table
+        """
+        try:
+            app_state = self._get_app_state()
+            tasks = app_state.tasks if hasattr(app_state, "tasks") else {}
+            team_context = app_state.team_context if hasattr(app_state, "team_context") else None
+        except Exception:
+            tasks = {}
+            team_context = None
+
+        # Collect teammates from both sources:
+        # 1. tasks (InProcessTeammateTaskState) - running agents
+        # 2. team_context.teammates - agent metadata including idle state
+
+        teammates_info = {}  # agent_name -> {is_idle, color, verb, task_id}
+
+        # Source 1: tasks (InProcessTeammateTaskState)
+        for task_id, task in tasks.items():
+            if hasattr(task, "identity"):
+                # InProcessTeammateTaskState dataclass
+                name = task.identity.agent_name
+                is_idle = task.is_idle if hasattr(task, "is_idle") else False
+                color = task.color or task.identity.color or "white"
+                verb = task.spinner_verb or "working"
+                teammates_info[name] = {
+                    "is_idle": is_idle,
+                    "color": color,
+                    "verb": verb,
+                    "task_id": task_id,
+                }
+            elif isinstance(task, dict) and (task.get("type") == "in_process_teammate" or task.get("agent_name")):
+                # Dict-style task
+                name = task.get("agent_name") or task.get("name") or "unknown"
+                is_idle = task.get("is_idle", False)
+                color = task.get("color") or "white"
+                verb = task.get("spinner_verb") or "working"
+                teammates_info[name] = {
+                    "is_idle": is_idle,
+                    "color": color,
+                    "verb": verb,
+                    "task_id": task_id,
+                }
+
+        # Source 2: team_context.teammates (metadata with isIdle)
+        if team_context and "teammates" in team_context:
+            for agent_id, teammate_info in team_context["teammates"].items():
+                name = teammate_info.get("name")
+                if name and name not in teammates_info:
+                    # Not in tasks, but exists in team_context
+                    is_idle = teammate_info.get("isIdle", True)
+                    color = teammate_info.get("color") or "white"
+                    teammates_info[name] = {
+                        "is_idle": is_idle,
+                        "color": color,
+                        "verb": "idle" if is_idle else "available",
+                        "task_id": None,
+                    }
+                elif name in teammates_info:
+                    # Update idle state from team_context if available
+                    if "isIdle" in teammate_info:
+                        teammates_info[name]["is_idle"] = teammate_info["isIdle"]
+
+        # Filter running teammates (not idle)
+        running_teammates = [name for name, info in teammates_info.items() if not info["is_idle"]]
+
+        # If no teammates at all, return empty
+        if not teammates_info:
+            return ""
+
+        # If no running teammates, show idle indicator with all teammate names
+        if not running_teammates:
+            spinner = SPINNER_CHARS[self._spinner_index]
+            idle_names = list(teammates_info.keys())
+            # Show all idle teammates
+            idle_text = Text()
+            idle_text.append(f"{spinner} ", style="dim")
+            for name in idle_names:
+                info = teammates_info[name]
+                rich_color = COLOR_MAP.get(info["color"], "white")
+                idle_text.append(f"● {name} ", style=rich_color)
+            idle_text.append("(idle)", style="dim")
+            return Panel(
+                idle_text,
+                padding=(0, 1),
+                border_style="dim",
+                title="Agents",
+                title_align="left",
+            )
+
+        # Build status table for running teammates
+        table = Table(
+            show_header=False,
+            show_edge=False,
+            padding=(0, 1),
+        )
+        table.add_column("status", width=40)
+
+        for name in running_teammates:
+            info = teammates_info[name]
+            rich_color = COLOR_MAP.get(info["color"], "white")
+            verb = info["verb"]
+
+            # Get spinner char
+            spinner = SPINNER_CHARS[self._spinner_index]
+
+            # Build status line
+            # Format: ● name: verb
+            status_text = Text()
+            status_text.append("● ", style=rich_color)
+            status_text.append(f"{name}: ", style="bold")
+            status_text.append(f"{spinner} {verb}", style=rich_color)
+
+            table.add_row(status_text)
+
+        return Panel(
+            table,
+            padding=(0, 1),
+            border_style="blue",
+            title="Running Agents",
+            title_align="left",
+        )
+
+    def is_running(self) -> bool:
+        """Check if display is running."""
+        return self._running
+
+
+def create_status_display(
+    get_app_state: Callable[[], Any],
+    set_app_state: Callable[[Callable[[Any], Any]], None],
+    console: Optional[Console] = None,
+) -> TeammateStatusDisplay:
+    """Factory function to create a status display.
+
+    Args:
+        get_app_state: Function to get current AppState
+        set_app_state: Function to update AppState
+        console: Optional Rich Console (shared from REPL to avoid conflicts)
+
+    Returns:
+        TeammateStatusDisplay instance
+    """
+    return TeammateStatusDisplay(get_app_state, set_app_state, console=console)
+
+
+__all__ = [
+    "TeammateStatusDisplay",
+    "create_status_display",
+    "COLOR_MAP",
+    "SPINNER_CHARS",
+]
