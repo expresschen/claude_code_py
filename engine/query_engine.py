@@ -76,6 +76,8 @@ class QueryEngineConfig:
     # Schema
     json_schema: Optional[dict[str, Any]] = None
 
+    show_permission_dialog: Optional[Callable[[], Any]] = None
+
     # Options
     verbose: bool = False
     replay_user_messages: bool = False
@@ -292,6 +294,7 @@ class QueryEngine:
             messages=self._messages,
             get_app_state=self.config.get_app_state,
             set_app_state=self.config.set_app_state,
+            show_permission_dialog=self.config.show_permission_dialog,
         )
 
     def _wrap_can_use_tool(self) -> CanUseToolFn:

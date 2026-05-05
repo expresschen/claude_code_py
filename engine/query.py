@@ -208,9 +208,6 @@ async def query(
                         state.messages.remove(message)
                         break  # Process one notification per iteration
 
-            # Leader: Check for permission requests from workers (bubble-up handling)
-            await _check_worker_permission_requests(params, state)
-
             # NEW: Apply microcompact BEFORE autocompact (moved from auto_compact_if_needed)
             async for event in _check_microcompact(params, state):
                 yield event
@@ -397,57 +394,6 @@ async def drain_pending_extraction(timeout_ms: int = 60000) -> None:
         if (asyncio.get_event_loop().time() - start) * 1000 > timeout_ms:
             break
         await asyncio.sleep(0.1)
-
-
-# =============================================================================
-# Worker Permission Request Check (Leader Side)
-# =============================================================================
-
-
-async def _check_worker_permission_requests(
-    params: QueryParams,
-    state: State,
-) -> None:
-    """Check for permission requests from worker teammates (Leader side).
-
-    When running as a team leader, this polls the mailbox for permission
-    requests from workers and displays them to the user.
-
-    Args:
-        params: Query parameters
-        state: Mutable state
-    """
-    # Only check if we have app_state access
-    if not params.tool_use_context.get_app_state:
-        return
-    if not params.tool_use_context.set_app_state:
-        return
-
-    try:
-        from claude_code_py.utils.swarm.leader_permission_handler import (
-            check_leader_permission_requests,
-        )
-
-        app_state = params.tool_use_context.get_app_state()
-        tools = params.tool_use_context.get_tools()
-
-        # Check for permission requests (only if leader)
-        requests = await check_leader_permission_requests(
-            get_app_state=params.tool_use_context.get_app_state,
-            set_app_state=params.tool_use_context.set_app_state,
-            tools=tools,
-            is_idle=not state.processing,  # Idle if not processing
-        )
-
-        # Log for debugging
-        if requests:
-            logger.debug(f"Leader processed {len(requests)} permission request(s)")
-
-    except ImportError:
-        # Swarm module not available
-        pass
-    except Exception as e:
-        logger.debug(f"Permission request check error: {e}")
 
 
 # =============================================================================

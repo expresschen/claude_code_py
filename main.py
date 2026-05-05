@@ -510,12 +510,14 @@ class REPL:
         # Run REPL loop
         while True:
             try:
-                # Check for pending questions/permissions from teammates BEFORE waiting for input
-                await self._handle_pending_questions()
-                await self._handle_pending_permissions()
-
-                # Clear interrupt event before waiting for input
+                # Clear interrupt event first, then drain pending items.
+                # Order matters: clearing after drain creates a race window
+                # where InboxPoller sets the interrupt between drain and clear,
+                # losing the signal and delaying handling until next user input.
                 self._interrupt_event.clear()
+
+                # Check for pending questions from teammates BEFORE waiting for input
+                await self._handle_pending_questions()
 
                 # Pause status display while waiting for input
                 if self._status_display:
@@ -542,12 +544,10 @@ class REPL:
 
                 # If interrupted, handle pending requests and continue loop
                 if was_interrupted:
-                    self._console.print("\n[yellow]Interrupted - handling pending request...[/yellow]")
                     # Clear the interrupt event
                     self._interrupt_event.clear()
-                    # Handle pending permissions/questions
-                    await self._handle_pending_questions()
-                    await self._handle_pending_permissions()
+                    # Pending questions will be drained at the top of
+                    # the loop — no need to handle them here too.
                     continue  # Restart loop to wait for input again
 
                 if not user_input:
@@ -700,72 +700,88 @@ class REPL:
         ))
 
     async def _handle_pending_permissions(self) -> None:
-        """Check and handle pending permission requests from teammates.
+        """Check and handle ALL pending permission requests from teammates.
 
-        This is called before each REPL input cycle. If there are pending
-        permission requests from teammates, prompt the user for approval
-        and send response back.
+        This is called before each REPL input cycle AND during main_loop
+        iterations. Processes all pending requests in FIFO order.
         """
-        app_state = self._store.get_state()
-        pending_permissions = app_state.pending_permissions or []
-
-        if not pending_permissions:
-            return
-
-        # Get the first pending permission request
-        perm = pending_permissions[0]
-        request_id = perm.get("request_id")
-        from_agent = perm.get("from_agent")
-        team_name = perm.get("team_name")
-        tool_name = perm.get("tool_name")
-        description = perm.get("description", "")
-        input_data = perm.get("input", {})
-
-        # Display permission request to user
-        self._console.print("\n" + "=" * 60)
-        self._console.print(f"[yellow] teammate '{from_agent}' requests permission:[/yellow]")
-        self._console.print("=" * 60)
-        self._console.print(f"\n[cyan]Tool:[/cyan] {tool_name}")
-        if description:
-            self._console.print(f"[cyan]Description:[/cyan] {description}")
-        if input_data:
-            # Show relevant input fields (truncate if too long)
-            for key, value in input_data.items():
-                if isinstance(value, str) and len(value) > 100:
-                    value = value[:100] + "..."
-                self._console.print(f"[cyan]{key}:[/cyan] {value}")
-
-        self._console.print(f"\n[bold]Allow this tool call?[/bold] [y/N/a=always] ")
-        response = await async_input()
-        response = response.strip().lower()
-
-        approved = response in ("y", "yes", "a", "always")
-
-        # Send response back to teammate via mailbox
         import json
         from datetime import datetime
         from claude_code_py.utils.swarm.permission_sync import (
             send_permission_response_via_mailbox,
         )
 
-        await send_permission_response_via_mailbox(
-            request_id=request_id,
-            team_name=team_name,
-            recipient_name=from_agent,
-            approved=approved,
-            error=None if approved else "User denied permission",
-        )
+        while True:
+            app_state = self._store.get_state()
+            pending_permissions = app_state.pending_permissions or []
 
-        if approved:
-            self._console.print(f"\n[green]✓ Permission approved for {from_agent}[/green]")
-        else:
-            self._console.print(f"\n[red]✗ Permission denied for {from_agent}[/red]")
+            if not pending_permissions:
+                break
 
-        # Remove the handled permission from pending queue
-        self._store.set_state(lambda prev: replace(
-            prev,
-            pending_permissions=[p for p in prev.pending_permissions if p.get("id") != perm.get("id")],
-        ))
+            # Get the first pending permission request
+            perm = pending_permissions[0]
+            request_id = perm.get("request_id")
+            from_agent = perm.get("from_agent")
+            team_name = perm.get("team_name")
+            tool_name = perm.get("tool_name")
+            description = perm.get("description", "")
+            input_data = perm.get("input", {})
+
+            # Display permission request to user
+            self._console.print("\n" + "=" * 60)
+            self._console.print(f"[yellow] teammate '{from_agent}' requests permission:[/yellow]")
+            self._console.print("=" * 60)
+            self._console.print(f"\n[cyan]Tool:[/cyan] {tool_name}")
+            if description:
+                self._console.print(f"[cyan]Description:[/cyan] {description}")
+            if input_data:
+                for key, value in input_data.items():
+                    if isinstance(value, str) and len(value) > 100:
+                        value = value[:100] + "..."
+                    self._console.print(f"[cyan]{key}:[/cyan] {value}")
+
+            self._console.print(f"\n[bold]Allow this tool call?[/bold] [y/N/a=always] ")
+            response = await async_input()
+            response = response.strip().lower()
+
+            approved = response in ("y", "yes", "a", "always")
+
+            # Bridge fast path: invoke callbacks directly (in-process workers)
+            callbacks = perm.get("_bridge_callbacks")
+            if callbacks and approved:
+                updated_input = input_data
+                callbacks["on_allow"](updated_input=updated_input)
+            elif callbacks and not approved:
+                callbacks["on_reject"](feedback="User denied permission")
+            else:
+                # Mailbox fallback: send response via teammate mailbox
+                await send_permission_response_via_mailbox(
+                    request_id=request_id,
+                    team_name=team_name,
+                    recipient_name=from_agent,
+                    approved=approved,
+                    error=None if approved else "User denied permission",
+                )
+
+            if approved:
+                self._console.print(f"[green]✓ Permission approved for {from_agent}[/green]")
+            else:
+                self._console.print(f"[red]✗ Permission denied for {from_agent}[/red]")
+
+            # Remove the handled permission from pending queue
+            self._store.set_state(lambda prev: replace(
+                prev,
+                pending_permissions=[p for p in prev.pending_permissions if p.get("id") != perm.get("id")],
+            ))
+
+    async def _show_permission_dialog(self) -> None:
+        """Callback for query main_loop to show permission dialogs.
+
+        This is registered as ToolUseContext.show_permission_dialog
+        and called from _check_worker_permission_requests during
+        message processing.
+        """
+        await self._handle_pending_permissions()
 
     def _stop_inbox_poller(self) -> None:
         """Stop the InboxPoller for teammate messages."""
@@ -799,6 +815,7 @@ class REPL:
             set_app_state=self._store.set_state,
             verbose=self.verbose,
             fallback_model=api_config.model,
+            show_permission_dialog=self._show_permission_dialog,
         )
 
         self._engine = QueryEngine(config)
@@ -834,9 +851,6 @@ class REPL:
                 prev,
                 pending_permissions=new_queue,
             ))
-
-            # Trigger interrupt to break out of input wait
-            self._interrupt_event.set()
 
         # Create permission context setter
         def permission_context_setter(
@@ -932,6 +946,7 @@ class REPL:
             self._store.set_state,
             submit_message_fn=submit_message_fn,
             interrupt_fn=interrupt_callback,
+            show_permission_dialog=self._show_permission_dialog,
         )
         poller.start()
 
