@@ -567,7 +567,6 @@ class SpawnTeammateConfig:
     tool_use_id: Optional[str] = None  # Tool use ID for correlation
     agent_type: Optional[str] = None  # Optional agent type specifier
     cwd: Optional[str] = None  # Working directory for teammate
-    interrupt_fn: Optional[Callable[[], None]] = None  # Callback to interrupt REPL input
 
 
 @dataclass
@@ -714,10 +713,8 @@ async def spawn_in_process_teammate_v2(
             description=config.description,
             teammate_context=teammate_context,
             model=config.model,
-            interrupt_fn=config.interrupt_fn,  # Pass interrupt callback
         )
         _debug_print(f"         InProcessRunnerConfig built")
-        _debug_print(f"         interrupt_fn={config.interrupt_fn is not None}")
 
         # Step i: Start runner and save thread handle
         _debug_print(f"[Step i] Starting in_process_teammate runner...")
