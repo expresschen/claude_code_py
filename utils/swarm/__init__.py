@@ -49,7 +49,6 @@ from .in_process_runner import (
     WaitResult,
     update_task_state,
     append_teammate_message,
-    handle_permission_request,
     check_and_compact,
     estimate_token_count,
     find_available_task,
