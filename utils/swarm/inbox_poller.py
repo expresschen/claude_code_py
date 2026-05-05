@@ -94,6 +94,7 @@ class InboxPollerConfig:
     set_app_state: Callable[[Any], None]
     submit_message_fn: Optional[Callable[[str], bool]] = None
     interrupt_fn: Optional[Callable[[], None]] = None
+    show_permission_dialog: Optional[Callable[[], Any]] = None  # Async callback to show permission dialog
 
 
 # =============================================================================
@@ -323,19 +324,21 @@ class InboxPoller:
                 regular_messages.append(m)
 
         # Process regular messages (matches TS lines 802-864)
-        if not regular_messages:
-            # No regular messages, but we may have processed other types - mark read
-            await mark_read()
-            return
+        if regular_messages:
+            logger.info(f"[InboxPoller] Processing {len(regular_messages)} regular message(s)")
+            self._queue_messages(regular_messages)
 
-        logger.info(f"[InboxPoller] Processing {len(regular_messages)} regular message(s)")
-
-        # Always queue messages - _deliver_pending_messages handles submission
-        # This ensures single submission entry point and consistent state checks
-        self._queue_messages(regular_messages)
-
-        # Mark messages as read after queueing
+        # Mark messages as read after processing all types
         await mark_read()
+
+        # Show permission dialog if any items are pending.
+        # This handles both mailbox-enqueued items (from _handle_permission_requests
+        # above) and Bridge-path items (enqueued directly to pending_permissions
+        # by permission_queue_setter between poll cycles).
+        if self.config.show_permission_dialog:
+            app_state = self.config.get_app_state()
+            if app_state.pending_permissions:
+                await self.config.show_permission_dialog()
 
     async def _handle_permission_requests(
         self,
@@ -348,6 +351,8 @@ class InboxPoller:
         Queue them for user approval in pending_permissions.
         Matches TS lines 250-364.
         """
+        pending_items: List[Dict[str, Any]] = []
+
         for m in permission_requests:
             parsed = is_permission_request(m.text)
             if not parsed:
@@ -372,7 +377,7 @@ class InboxPoller:
             else:
                 # Queue for user approval
                 _debug_print(f"Queueing permission request: {tool_name} from {from_agent}")
-                pending_permission = {
+                pending_items.append({
                     "id": str(uuid.uuid4()),
                     "request_id": request_id,
                     "from_agent": from_agent,
@@ -383,17 +388,22 @@ class InboxPoller:
                     "input": parsed.input,
                     "timestamp": datetime.now().isoformat(),
                     "status": "pending",
-                }
+                })
 
-                self.config.set_app_state(lambda prev: replace(
-                    prev,
-                    pending_permissions=(prev.pending_permissions or []) + [pending_permission],
-                ))
+        # Batch-initialize pending_permissions from all queued items.
+        # The dialog is shown later in _process_inbox after ALL message
+        # types are handled — this way Bridge-path items (enqueued directly
+        # to pending_permissions) are also included in one dialog session.
+        if pending_items:
+            self.config.set_app_state(lambda prev: replace(
+                prev,
+                pending_permissions=(prev.pending_permissions or []) + pending_items,
+            ))
 
-                # Trigger interrupt to notify REPL
-                if self.config.interrupt_fn:
-                    _debug_print(f"Triggering interrupt for permission request")
-                    self.config.interrupt_fn()
+            # Interrupt fallback (only when show_permission_dialog unavailable)
+            if self.config.show_permission_dialog is None and self.config.interrupt_fn:
+                _debug_print(f"Triggering interrupt for {len(pending_items)} permission request(s)")
+                self.config.interrupt_fn()
 
     async def _handle_question_requests(
         self,
@@ -729,6 +739,7 @@ def create_inbox_poller(
     set_app_state: Callable[[Any], None],
     submit_message_fn: Optional[Callable[[str], bool]] = None,
     interrupt_fn: Optional[Callable[[], None]] = None,
+    show_permission_dialog: Optional[Callable[[], Any]] = None,
 ) -> InboxPoller:
     """Create an InboxPoller instance.
 
@@ -748,6 +759,7 @@ def create_inbox_poller(
         set_app_state=set_app_state,
         submit_message_fn=submit_message_fn,
         interrupt_fn=interrupt_fn,
+        show_permission_dialog=show_permission_dialog,
     )
     return InboxPoller(config)
 

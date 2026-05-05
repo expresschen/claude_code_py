@@ -60,17 +60,6 @@ from claude_code_py.utils.teammate_context import (
     get_current_agent_id,
 )
 from claude_code_py.task.types import TaskStatus
-from claude_code_py.utils.swarm.permission_sync import (
-    create_permission_request,
-    send_permission_request_via_mailbox,
-    send_permission_response_via_mailbox,
-)
-from claude_code_py.utils.swarm.permission_bridge import (
-    get_leader_permission_queue,
-    enqueue_permission_request,
-    PermissionQueueItem,
-    WorkerBadge,
-)
 from claude_code_py.utils.swarm.spawn_in_process import (
     generate_task_id,
 )
@@ -85,7 +74,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_MS = 500
-PERMISSION_POLL_INTERVAL_MS = 500
 
 # Compaction threshold (in estimated tokens)
 COMPACT_THRESHOLD_TOKENS = 100000
@@ -169,7 +157,6 @@ class InProcessRunnerConfig:
     system_prompt: Optional[str] = None
     system_prompt_mode: str = "default"  # 'default', 'replace', 'append'
     max_turns: int = 10
-    interrupt_fn: Optional[Callable[[], None]] = None  # Callback to interrupt REPL input
 
 
 @dataclass
@@ -608,200 +595,6 @@ async def wait_for_next_prompt(
 
     _debug_print(f"⚠️ Exiting poll loop (abort={abort_controller.signal.aborted})")
     return WaitResult(type="aborted")
-
-
-# =============================================================================
-# Permission Handling
-# =============================================================================
-
-
-async def handle_permission_request(
-    config: InProcessRunnerConfig,
-    tool_name: str,
-    tool_use_id: str,
-    input: Dict[str, Any],
-    description: str,
-    abort_controller: AbortController,
-) -> Dict[str, Any]:
-    """Handle a permission request for an in-process teammate.
-
-    Uses Bridge path (direct UI queue) when available, otherwise falls back
-    to mailbox system. Matches TypeScript inProcessRunner.ts behavior.
-
-    Args:
-        config: InProcessRunnerConfig with identity and interrupt_fn
-        tool_name: Tool requesting permission
-        tool_use_id: Tool use ID
-        input: Tool input
-        description: Permission description
-        abort_controller: AbortController for cancellation
-
-    Returns:
-        Permission decision dict with 'behavior' key
-    """
-    identity = config.identity
-
-    # Check if Bridge is available (direct UI queue path)
-    queue_setter = get_leader_permission_queue()
-
-    if queue_setter:
-        # Bridge path: direct UI queue entry
-        _debug_print(f"handle_permission_request: Using Bridge path for {tool_name}")
-
-        # Create response future for async callback resolution
-        response_future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-        def on_allow(updated_input=None, permission_updates=None, feedback=None):
-            """Callback when user allows permission."""
-            if not response_future.done():
-                # Send response via mailbox for teammate to receive
-                asyncio.create_task(
-                    send_permission_response_via_mailbox(
-                        request_id=request.id,
-                        team_name=identity.team_name,
-                        recipient_name=identity.agent_name,
-                        approved=True,
-                        updated_input=updated_input or input,
-                    )
-                )
-                response_future.set_result({
-                    "behavior": "allow",
-                    "updated_input": updated_input or input,
-                })
-
-        def on_reject(feedback=None):
-            """Callback when user rejects permission."""
-            if not response_future.done():
-                asyncio.create_task(
-                    send_permission_response_via_mailbox(
-                        request_id=request.id,
-                        team_name=identity.team_name,
-                        recipient_name=identity.agent_name,
-                        approved=False,
-                        error=feedback or "Permission denied",
-                    )
-                )
-                response_future.set_result({
-                    "behavior": "reject",
-                    "message": feedback or "Permission denied",
-                })
-
-        def on_abort():
-            """Callback when permission is aborted."""
-            if not response_future.done():
-                response_future.set_result({
-                    "behavior": "reject",
-                    "message": "Permission request aborted",
-                })
-
-        # Create PermissionQueueItem for UI
-        request = create_permission_request(
-            tool_name=tool_name,
-            tool_use_id=tool_use_id,
-            input=input,
-            description=description,
-            team_name=identity.team_name,
-            worker_id=identity.agent_id,
-            worker_name=identity.agent_name,
-            worker_color=identity.color,
-        )
-
-        queue_item = PermissionQueueItem(
-            assistant_message=None,
-            tool=tool_name,
-            description=description,
-            input=input,
-            tool_use_context=None,
-            tool_use_id=tool_use_id,
-            permission_result=None,
-            worker_badge=WorkerBadge(
-                name=identity.agent_name,
-                color=identity.color or "cyan",
-            ).to_dict() if identity.agent_name else None,
-            permission_prompt_start_time_ms=int(time.time() * 1000),
-            on_allow=on_allow,
-            on_reject=on_reject,
-            on_abort=on_abort,
-            on_user_interaction=lambda: None,
-            recheck_permission=lambda: None,
-        )
-
-        # Enqueue to Leader UI
-        enqueue_permission_request(queue_item)
-        _debug_print(f"   Permission request enqueued via Bridge: {request.id}")
-
-        # Trigger interrupt to notify Leader REPL immediately
-        if config.interrupt_fn:
-            _debug_print(f"   Triggering interrupt callback")
-            config.interrupt_fn()
-
-        # Wait for response (via future set by callbacks)
-        while not abort_controller.signal.aborted:
-            try:
-                # Check future with timeout
-                result = await asyncio.wait_for(
-                    response_future,
-                    timeout=PERMISSION_POLL_INTERVAL_MS / 1000,
-                )
-                return result
-            except asyncio.TimeoutError:
-                # Continue polling
-                continue
-
-        # Aborted
-        if not response_future.done():
-            response_future.set_result({
-                "behavior": "reject",
-                "message": "Aborted",
-            })
-        return response_future.result()
-
-    else:
-        # Fallback: mailbox path (no Bridge available)
-        _debug_print(f"handle_permission_request: Using mailbox fallback for {tool_name}")
-
-        request = create_permission_request(
-            tool_name=tool_name,
-            tool_use_id=tool_use_id,
-            input=input,
-            description=description,
-            team_name=identity.team_name,
-            worker_id=identity.agent_id,
-            worker_name=identity.agent_name,
-            worker_color=identity.color,
-        )
-
-        # Send via mailbox
-        await send_permission_request_via_mailbox(request)
-        _debug_print(f"   Permission request sent via mailbox: {request.id}")
-
-        # Trigger interrupt to notify Leader REPL
-        if config.interrupt_fn:
-            _debug_print(f"   Triggering interrupt callback")
-            config.interrupt_fn()
-
-        # Poll for response in teammate mailbox
-        while not abort_controller.signal.aborted:
-            await asyncio.sleep(PERMISSION_POLL_INTERVAL_MS / 1000)
-
-            messages = await read_mailbox(identity.agent_name, identity.team_name)
-            for msg in messages:
-                if not msg.read:
-                    parsed = is_permission_response(msg.text)
-                    if parsed and parsed.request_id == request.id:
-                        await mark_messages_as_read(identity.agent_name, identity.team_name)
-                        if parsed.subtype == "success":
-                            return {
-                                "behavior": "allow",
-                                "updated_input": parsed.response.get("updated_input", input),
-                            }
-                        else:
-                            return {
-                                "behavior": "reject",
-                                "message": parsed.error or "Permission denied",
-                            }
-
-        return {"behavior": "reject", "message": "Aborted"}
 
 
 # =============================================================================
@@ -1296,7 +1089,6 @@ __all__ = [
     "try_claim_next_task",
     "wait_for_next_prompt",
     "format_teammate_xml",
-    "handle_permission_request",
     "check_and_compact",
     "estimate_token_count",
     "find_available_task",

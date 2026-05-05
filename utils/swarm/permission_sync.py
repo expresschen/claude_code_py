@@ -947,8 +947,8 @@ async def request_permission_from_leader(
     """Request permission from leader for a dangerous operation.
 
     This is the main entry point for swarm workers to bubble permission
-    requests to the team leader. The worker sends a request via mailbox
-    and polls for the leader's response.
+    requests to the team leader. Tries Bridge path (direct UI queue) first,
+    falls back to mailbox system when Bridge is unavailable.
 
     Args:
         tool_name: Name of the tool requiring permission
@@ -969,7 +969,9 @@ async def request_permission_from_leader(
         mark_messages_as_read,
         TeammateMessage,
     )
-    from claude_code_py.utils.swarm.constants import TEAM_LEAD_NAME
+    from claude_code_py.utils.swarm.permission_bridge import (
+        get_leader_permission_queue,
+    )
 
     team_name = get_current_team_name()
     worker_id = get_current_agent_id()
@@ -983,7 +985,7 @@ async def request_permission_from_leader(
             "timeout": False,
         }
 
-    # Create and send permission request
+    # Create permission request (shared between bridge and mailbox paths)
     request = create_permission_request(
         tool_name=tool_name,
         tool_use_id=tool_use_id,
@@ -998,17 +1000,106 @@ async def request_permission_from_leader(
     # Track pending request
     PermissionRequestStatus.add(request)
 
-    # Send to leader mailbox
+    # ─────────────────────────────────────────────────────
+    # Path 1: Bridge (direct UI queue)
+    # ─────────────────────────────────────────────────────
+    queue_setter = get_leader_permission_queue()
+
+    if queue_setter:
+        # Create future for async callback resolution
+        response_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+        def on_allow(updated_input=None, permission_updates=None, feedback=None):
+            if not response_future.done():
+                asyncio.create_task(
+                    send_permission_response_via_mailbox(
+                        request_id=request.id,
+                        team_name=team_name,
+                        recipient_name=worker_name,
+                        approved=True,
+                        updated_input=updated_input or tool_input,
+                    )
+                )
+                response_future.set_result({
+                    "behavior": "allow",
+                    "updated_input": updated_input or tool_input,
+                    "message": None,
+                    "timeout": False,
+                })
+
+        def on_reject(feedback=None):
+            if not response_future.done():
+                asyncio.create_task(
+                    send_permission_response_via_mailbox(
+                        request_id=request.id,
+                        team_name=team_name,
+                        recipient_name=worker_name,
+                        approved=False,
+                        error=feedback or "Permission denied",
+                    )
+                )
+                response_future.set_result({
+                    "behavior": "reject",
+                    "message": feedback or "Permission denied",
+                    "timeout": False,
+                })
+
+        def on_abort():
+            if not response_future.done():
+                response_future.set_result({
+                    "behavior": "reject",
+                    "message": "Permission request aborted",
+                    "timeout": False,
+                })
+
+        # Enqueue to Leader UI — unified dict format (same shape as mailbox path)
+        pending_item = {
+            "id": f"perm-bridge-{request.id}",
+            "request_id": request.id,
+            "from_agent": worker_name,
+            "team_name": team_name,
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "description": description,
+            "input": tool_input,
+            "timestamp": datetime.now().isoformat(),
+            "status": "pending",
+            "_bridge_callbacks": {
+                "on_allow": on_allow,
+                "on_reject": on_reject,
+                "on_abort": on_abort,
+            },
+        }
+        queue_setter(lambda prev: prev + [pending_item])
+
+        # Wait for response via future (Bridge callbacks set the future)
+        try:
+            result = await asyncio.wait_for(
+                response_future,
+                timeout=timeout_ms / 1000,
+            )
+            PermissionRequestStatus.remove(request.id)
+            return result
+        except asyncio.TimeoutError:
+            PermissionRequestStatus.remove(request.id)
+            return {
+                "behavior": "reject",
+                "message": "Permission request timed out",
+                "timeout": True,
+            }
+
+    # ─────────────────────────────────────────────────────
+    # Path 2: Mailbox fallback (no Bridge available)
+    # ─────────────────────────────────────────────────────
     await send_permission_request_via_mailbox(request)
 
-    # Poll for response
+    # Poll for response in teammate mailbox
     start_time = time.time()
     poll_interval = 0.5  # 500ms
 
     while (time.time() - start_time) * 1000 < timeout_ms:
         await asyncio.sleep(poll_interval)
 
-        # Check mailbox for response
         messages = await read_mailbox(worker_name, team_name)
         for msg in messages:
             if msg and not msg.read:
@@ -1017,7 +1108,6 @@ async def request_permission_from_leader(
                     if data.get("type") == "permission_response":
                         response_id = data.get("request_id")
                         if response_id == request.id:
-                            # Found our response
                             await mark_messages_as_read(worker_name, team_name)
                             PermissionRequestStatus.remove(request.id)
 

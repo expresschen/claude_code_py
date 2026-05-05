@@ -157,6 +157,7 @@ class ToolUseContext:
     agent_name: Optional[str] = None
     team_name: Optional[str] = None
     parent_session_id: Optional[str] = None
+    show_permission_dialog: Optional[Callable[[], Any]] = None  # Show permission dialog in main_loop
 
     # Worktree context 新增字段
     worktree_path: Optional[str] = None

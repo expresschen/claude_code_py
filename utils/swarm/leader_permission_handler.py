@@ -13,17 +13,12 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from claude_code_py.utils.swarm.permission_bridge import (
-    get_leader_permission_queue,
-    enqueue_permission_request,
-    PermissionQueueItem,
-    WorkerBadge,
-)
 from claude_code_py.utils.swarm.permission_sync import (
-    send_permission_response_via_mailbox,
     is_team_leader,
 )
 from claude_code_py.utils.swarm.constants import TEAM_LEAD_NAME
@@ -147,25 +142,28 @@ async def process_permission_requests(
     app_state: Optional["AppState"] = None,
     tools: Optional[List["Tool"]] = None,
     set_app_state: Optional[Callable] = None,
-    on_show_dialog: Optional[Callable[[ProcessedPermissionRequest], None]] = None,
 ) -> List[ProcessedPermissionRequest]:
     """Process pending permission requests from worker teammates.
 
-    This is called by the leader to check for new permission requests
-    in the mailbox and route them to the UI.
+    Reads the leader's mailbox for permission requests and adds them
+    directly to pending_permissions in AppState. The actual dialog display
+    is handled by the REPL loop or _check_worker_permission_requests.
 
     Args:
         team_name: Team name to check requests for
         app_state: Current app state (optional, for context)
         tools: Available tools list (optional, for tool lookup)
         set_app_state: Function to update app state (optional)
-        on_show_dialog: Callback to show permission dialog (optional)
 
     Returns:
         List of processed permission requests
     """
     if not is_team_leader(team_name):
         logger.debug("Not a team leader, skipping permission request check")
+        return []
+
+    if not set_app_state:
+        logger.debug("No set_app_state, skipping permission request processing")
         return []
 
     # Read leader's mailbox
@@ -189,6 +187,7 @@ async def process_permission_requests(
     logger.debug(f"Found {len(permission_requests)} permission request(s)")
 
     processed: List[ProcessedPermissionRequest] = []
+    new_items: List[Dict[str, Any]] = []
 
     for msg in permission_requests:
         parsed = is_permission_request_message(msg.text)
@@ -200,11 +199,15 @@ async def process_permission_requests(
             logger.debug("Invalid permission request: missing required fields")
             continue
 
+        request_id = parsed["request_id"]
+        tool_name = parsed["tool_name"]
+        worker_name = parsed.get("agent_id", msg.from_agent)
+
         request = ProcessedPermissionRequest(
-            request_id=parsed["request_id"],
-            tool_name=parsed["tool_name"],
+            request_id=request_id,
+            tool_name=tool_name,
             tool_use_id=parsed.get("tool_use_id", ""),
-            worker_name=parsed.get("agent_id", msg.from_agent),
+            worker_name=worker_name,
             worker_color=msg.color,
             description=parsed.get("description", ""),
             input=parsed.get("input", {}),
@@ -213,66 +216,28 @@ async def process_permission_requests(
         )
         processed.append(request)
 
-        # Route to UI queue if available
-        queue_setter = get_leader_permission_queue()
-        if queue_setter:
-            # Create PermissionQueueItem for UI
-            queue_item = PermissionQueueItem(
-                assistant_message=None,  # No message context from worker
-                tool=request.tool_name,  # Tool name string
-                description=request.description,
-                input=request.input,
-                tool_use_context=None,
-                tool_use_id=request.tool_use_id,
-                permission_result=None,
-                worker_badge=WorkerBadge(
-                    name=request.worker_name,
-                    color=request.worker_color or "cyan",
-                ).to_dict() if request.worker_name else None,
-                permission_prompt_start_time_ms=request.created_at,
-                # Callbacks for user response
-                on_allow=lambda updated_input=None, permission_updates=None: (
-                    asyncio.create_task(
-                        send_permission_response_via_mailbox(
-                            request.request_id,
-                            team_name,
-                            request.worker_name,
-                            approved=True,
-                            updated_input=updated_input,
-                        )
-                    )
-                ),
-                on_reject=lambda feedback=None: (
-                    asyncio.create_task(
-                        send_permission_response_via_mailbox(
-                            request.request_id,
-                            team_name,
-                            request.worker_name,
-                            approved=False,
-                            error=feedback,
-                        )
-                    )
-                ),
-                on_abort=lambda: (
-                    asyncio.create_task(
-                        send_permission_response_via_mailbox(
-                            request.request_id,
-                            team_name,
-                            request.worker_name,
-                            approved=False,
-                            error="Permission request aborted",
-                        )
-                    )
-                ),
-            )
+        # Build pending_permission item for AppState
+        pending_item = {
+            "id": str(uuid.uuid4()),
+            "request_id": request_id,
+            "from_agent": worker_name,
+            "team_name": team_name,
+            "tool_name": tool_name,
+            "tool_use_id": parsed.get("tool_use_id", ""),
+            "description": parsed.get("description", ""),
+            "input": parsed.get("input", {}),
+            "timestamp": datetime.now().isoformat(),
+            "status": "pending",
+        }
+        new_items.append(pending_item)
+        logger.debug(f"Added permission request {request_id} from {worker_name}")
 
-            # Enqueue the request
-            enqueue_permission_request(queue_item)
-            logger.debug(f"Enqueued permission request {request.request_id}")
-
-        # Call custom dialog callback if provided
-        if on_show_dialog:
-            on_show_dialog(request)
+    if new_items:
+        # Directly append to pending_permissions in AppState
+        set_app_state(lambda prev: replace(
+            prev,
+            pending_permissions=(prev.pending_permissions or []) + new_items,
+        ))
 
     # Mark messages as read after processing
     await mark_messages_as_read(TEAM_LEAD_NAME, team_name)
