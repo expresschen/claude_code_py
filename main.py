@@ -561,16 +561,18 @@ class REPL:
                 # losing the signal and delaying handling until next user input.
                 self._interrupt_event.clear()
 
+                # Mark as waiting for input BEFORE any async work (prevents
+                # InboxPoller from delivering messages and switching terminal
+                # to raw mode while we're about to read from stdin).
+                self._waiting_for_input = True
+                self._store.set_state(lambda prev: replace(prev, is_waiting_for_input=True))
+
                 # Check for pending questions from teammates BEFORE waiting for input
                 await self._handle_pending_questions()
 
                 # Pause status display while waiting for input
                 if self._status_display:
                     self._status_display.pause()
-
-                # Mark as waiting for input (prevents InboxPoller message submission)
-                self._waiting_for_input = True
-                self._store.set_state(lambda prev: replace(prev, is_waiting_for_input=True))
 
                 # Check if viewing an agent - change prompt accordingly
                 app_state = self._store.get_state()
@@ -595,14 +597,18 @@ class REPL:
                     on_shift_down=lambda: self._handle_shift_navigation(1),
                 )
 
-                # No longer waiting for input
+                # No longer waiting for input — this creates a deliberate
+                # window where both is_loading and is_waiting_for_input are
+                # False, allowing InboxPoller to deliver pending messages.
+                # _process_incoming_message no longer touches terminal mode,
+                # so delivery during this gap is safe.
                 self._waiting_for_input = False
                 self._store.set_state(lambda prev: replace(prev, is_waiting_for_input=False))
 
                 # Resume status display after input received
                 if self._status_display:
                     self._status_display.resume()
-                
+
                 # If interrupted or aborted, handle pending requests and continue loop
                 if was_aborted:
                     # Clear the interrupt event
@@ -1033,9 +1039,10 @@ class REPL:
             Returns:
                 True if submission succeeded, False if rejected
             """
-            # Only reject if busy processing (LLM running)
-            # NOTE: We allow submission even when waiting on stdin.readline(),
-            # matching TypeScript's behavior (focusedInputDialog is for dialogs, not stdin).
+            # Only reject if busy processing (LLM running).
+            # We intentionally do NOT check _waiting_for_input here because
+            # _process_incoming_message no longer switches terminal mode,
+            # so it is safe to start even while input() is blocking.
             if self._is_loading:
                 return False
 
@@ -1107,18 +1114,15 @@ class REPL:
         """Process an incoming teammate message asynchronously.
 
         This is called by the InboxPoller callback.
+        Does NOT switch terminal to raw mode — this runs in the background
+        and must not interfere with the REPL's terminal state (e.g., input()
+        echo during input_async, or the outer _process_message's listener).
 
         Args:
             formatted_content: XML-wrapped message content
         """
         if not self._engine:
             return
-
-        # Start keyboard listener for execution phase
-        self._escape_input.start_execution_listener(
-            on_escape=self._handle_escape,
-            on_ctrl_c=self._handle_ctrl_c,
-        )
 
         try:
             # Process message through query engine
@@ -1160,8 +1164,6 @@ class REPL:
                 traceback.print_exc()
 
         finally:
-            # Stop keyboard listener
-            self._escape_input.stop_execution_listener()
             # Reset loading state
             self._is_loading = False
             self._store.set_state(lambda prev: replace(prev, is_loading=False))

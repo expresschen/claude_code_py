@@ -657,9 +657,13 @@ class InboxPoller:
         logger.debug(f"[InboxPoller._deliver] is_loading={is_loading}")
         _debug_print(f"_deliver_pending_messages: is_loading={is_loading}")
 
-        # Skip if busy (LLM processing)
+        # Skip if busy (LLM processing).
+        # Unlike TS, we do NOT gate on focusedInputDialog/is_waiting_for_input
+        # because _process_incoming_message no longer switches terminal mode
+        # (it runs in cooked mode), so it is safe to deliver while waiting
+        # for user input.
         if is_loading:
-            _debug_print(f"Skipping delivery: session busy (loading)")
+            _debug_print(f"Skipping delivery: session busy (loading={is_loading})")
             return
 
         inbox_messages = app_state.inbox.get("messages", [])
