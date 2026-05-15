@@ -48,6 +48,7 @@ from claude_code_py.utils.teammate_mailbox import (
     TEAMMATE_MESSAGE_TAG,
 )
 from claude_code_py.utils.team import TEAM_LEAD_NAME
+from claude_code_py.storage.session import SessionStorage
 from claude_code_py.utils.task.file_storage import (
     list_tasks,
     claim_task,
@@ -153,10 +154,11 @@ class InProcessRunnerConfig:
     model: Optional[str] = None
     agent_type: Optional[str] = None
     allowed_tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
     allow_permission_prompts: bool = False
     system_prompt: Optional[str] = None
     system_prompt_mode: str = "default"  # 'default', 'replace', 'append'
-    max_turns: int = 10
+    max_turns: Optional[int] = None
 
 
 @dataclass
@@ -650,6 +652,14 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
     task_list_id = identity.parent_session_id
     all_messages: List["Message"] = []
 
+    # Create session storage for sidechain writes (agent transcript persistence).
+    # Uses the leader's session ID so agent transcripts live under the same session.
+    session_storage = SessionStorage(identity.parent_session_id, config.tool_use_context.get_cwd())
+
+    # Track the last recorded message UUID for parent chain continuity.
+    # Matches TypeScript runAgent.ts: lastRecordedUuid pattern.
+    last_recorded_uuid: Optional[str] = None
+
     _debug_print("=" * 70)
     _debug_print("run_in_process_teammate: STARTING")
     _debug_print(f"  agent_id: '{identity.agent_id}'")
@@ -689,6 +699,7 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
     should_exit = False
     iteration_count = 0
     current_task_id: Optional[str] = None  # Track current task for completion reporting
+    last_error: Optional[str] = None  # Track last error for idle notification summary
 
     # Try to claim an available task immediately so the UI can show activity
     # from the very start. The idle loop handles claiming for subsequent tasks.
@@ -776,7 +787,7 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
                     description=config.description or f"{identity.agent_name} task",
                     model=config.model,
                     tools=config.allowed_tools or ["*"],
-                    disallowed_tools=[],
+                    disallowed_tools=config.disallowed_tools or [],
                     run_in_background=False,
                     cwd=config.tool_use_context.get_cwd(),  # Use cwd from tool context
                     max_turns=config.max_turns,
@@ -787,24 +798,25 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
                 _debug_print(f"   AgentRunConfig: agent_id='{agent_config.agent_id}', agent_type='{agent_config.agent_type}'")
 
                 try:
-                    _debug_print("   → Calling run_agent()...")
-                    result = await run_agent(agent_config, None)
-                    _debug_print("   ← run_agent() returned")
-                    _debug_print(f"   result.status: '{result.status}'")
-                    _debug_print(f"   result.messages: {len(result.messages or [])} messages")
+                    # Use streaming to process each message in real-time.
+                    # Matches TypeScript runAgent.ts: for-await-of + yield,
+                    # where each message is written to disk (sidechain) before
+                    # being yielded to the caller.
+                    from claude_code_py.tools.agent_tool.run_agent import run_agent_stream
 
-                    iteration_messages = result.messages or []
-                    all_messages.extend(iteration_messages)
+                    _debug_print("   → Starting streaming agent execution...")
+                    iteration_messages = []
+                    async for msg in run_agent_stream(agent_config):
+                        iteration_messages.append(msg)
+                        all_messages.append(msg)
 
-                    # Count tool calls from messages
-                    for msg in iteration_messages:
+                        # Update progress (tool counting, spinner verb)
                         if hasattr(msg, "message"):
                             content = msg.message.get("content", [])
                             if isinstance(content, list):
                                 for block in content:
                                     if isinstance(block, dict) and block.get("type") == "tool_use":
                                         progress_tracker.total_tool_calls += 1
-                                        # Update spinner_verb to show current tool
                                         tool_name = block.get("name", "tool")
                                         update_task_state(
                                             config.task_id,
@@ -819,11 +831,33 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
                                         )
                         update_progress_from_message(progress_tracker, msg)
 
-                    _debug_print(f"   Total tool calls this iteration: {progress_tracker.total_tool_calls}")
+                        # Write to sidechain JSONL — disk-write-before-yield
+                        msg_uuid = getattr(msg, "uuid", None)
+                        msg_type = getattr(msg, "type", None)
+                        try:
+                            session_storage.insert_message_chain(
+                                [msg],
+                                is_sidechain=True,
+                                agent_id=identity.agent_id,
+                                starting_parent_uuid=last_recorded_uuid,
+                            )
+                        except Exception:
+                            pass
+
+                        # Append to task.messages so transcript view sees it immediately
+                        append_teammate_message(config.task_id, msg, set_app_state)
+
+                        # Track last recorded UUID for parent chain (skip progress)
+                        if msg_uuid and msg_type != "progress":
+                            last_recorded_uuid = msg_uuid
+
+                    _debug_print(f"   ← Streaming loop completed: {len(iteration_messages)} messages")
+                    _debug_print(f"   Total tool calls: {progress_tracker.total_tool_calls}")
 
                 except Exception as e:
                     _debug_print(f"   ❌ Agent execution error: {type(e).__name__}: {e}")
                     logger.debug(f"Agent execution error: {e}")
+                    last_error = f"{type(e).__name__}: {e}"
 
                 # Check lifecycle abort (kills whole teammate)
                 if abort_controller.signal.aborted:
@@ -896,31 +930,44 @@ async def run_in_process_teammate(config: InProcessRunnerConfig) -> InProcessRun
             else:
                 _debug_print("→ Sending idle notification to leader...")
 
-                # Generate summary from activity or last message
-                summary = progress_tracker.current_activity
+                # Generate summary from last meaningful message
+                summary = None
                 if current_task_id:
-                    # If we completed a task, create a meaningful summary
                     summary = f"Completed task #{current_task_id}"
-                elif all_messages:
-                    # Extract brief summary from last assistant message
+                if not summary and all_messages:
+                    # Scan messages in reverse for usable text content.
+                    # Covers assistant, system (e.g. max-turns), and user messages.
                     for msg in reversed(all_messages):
-                        if hasattr(msg, "type") and msg.type == "assistant":
+                        content = None
+                        if hasattr(msg, "type") and hasattr(msg, "message"):
                             content = msg.message.get("content", "")
-                            if isinstance(content, str) and len(content) > 0:
-                                # Skip XML-formatted teammate messages (they're not meaningful summaries)
-                                if content.startswith("<teammate_message") or content.startswith("<"):
-                                    continue
-                                # Use first 80 chars as summary
-                                summary = content[:80] + "..." if len(content) > 80 else content
+                        elif hasattr(msg, "type") and hasattr(msg, "content"):
+                            # SystemMessage: content is a direct attribute
+                            content = msg.content or ""
+                        elif isinstance(msg, dict):
+                            inner = msg.get("message", {})
+                            if isinstance(inner, dict) and "content" in inner:
+                                content = inner["content"]
+                            else:
+                                content = msg.get("content", "")
+                        if not content:
+                            continue
+                        if isinstance(content, str) and content.strip():
+                            if content.startswith("<teammate_message") or content.startswith("<"):
+                                continue
+                            summary = content[:80] + "..." if len(content) > 80 else content
+                            break
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    text = block.get("text", "")
+                                    if text and not text.startswith("<"):
+                                        summary = text[:80] + "..." if len(text) > 80 else text
+                                        break
+                            if summary:
                                 break
-                            elif isinstance(content, list):
-                                # Extract text from content blocks
-                                for block in content:
-                                    if isinstance(block, dict) and block.get("type") == "text":
-                                        text = block.get("text", "")
-                                        if text and not text.startswith("<"):
-                                            summary = text[:80] + "..." if len(text) > 80 else text
-                                            break
+                if not summary:
+                    summary = "No output produced — send shutdown to this teammate"
 
                 await send_idle_notification(
                     identity.agent_name,

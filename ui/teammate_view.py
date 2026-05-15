@@ -6,6 +6,7 @@ and navigating between agents in a team.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable, Any
 from enum import Enum
@@ -107,7 +108,15 @@ def get_teammate_count(app_state: AppState) -> int:
 # =============================================================================
 
 
-PANEL_GRACE_MS = 30_000  # 30 seconds before evicting completed tasks
+PANEL_GRACE_MS = 30_000  # 30 seconds before evicting completed tasks (ms)
+
+# Terminal task statuses that trigger eviction after grace period
+_TERMINAL_STATUSES = {"completed", "killed", "failed", "error"}
+
+
+def _is_terminal_task_status(status: str) -> bool:
+    """Check if a task status is terminal (completed/killed/failed/error)."""
+    return status in _TERMINAL_STATUSES
 
 
 def enter_teammate_view(
@@ -117,6 +126,10 @@ def enter_teammate_view(
     """Enter teammate view to see their status and messages.
 
     Sets viewing_agent_task_id and retain=True to prevent eviction.
+    If switching from another agent, releases the previous one back to stub.
+    On first retain, triggers disk bootstrap: reads sidechain JSONL and
+    UUID-merges with live messages.
+    Matches TypeScript enterTeammateView() in teammateViewHelpers.ts.
     """
     from dataclasses import replace
 
@@ -125,17 +138,66 @@ def enter_teammate_view(
         if not task or not is_in_process_teammate_task(task):
             return prev
 
-        new_tasks = dict(prev.tasks)
-
-        # Release previous viewed task if any
         prev_id = prev.viewing_agent_task_id
-        if prev_id and prev_id != task_id:
-            prev_task = new_tasks.get(prev_id)
-            if prev_task and is_in_process_teammate_task(prev_task):
-                new_tasks[prev_id] = _release_task(prev_task)
+        prev_task = prev.tasks.get(prev_id) if prev_id else None
+        switching = (
+            prev_id is not None
+            and prev_id != task_id
+            and is_in_process_teammate_task(prev_task)
+            and prev_task.retain
+        )
+        needs_retain = not task.retain or task.evict_after is not None
+        needs_view = (
+            prev.viewing_agent_task_id != task_id
+            or prev.view_selection_mode != ViewSelectionMode.VIEWING.value
+        )
 
-        # Set retain on new task
-        new_tasks[task_id] = _set_retain(task, True)
+        if not needs_retain and not needs_view and not switching:
+            return prev
+
+        new_tasks = dict(prev.tasks)
+        if switching or needs_retain:
+            if switching:
+                new_tasks[prev_id] = _release_task(prev_task)
+            if needs_retain:
+                new_tasks[task_id] = _set_retain(task, True)
+
+        # Disk bootstrap: first retain of a task that hasn't loaded disk yet.
+        # Read sidechain JSONL and UUID-merge with whatever stream has appended.
+        # Use prev.session_id first; fall back to identity.parent_session_id
+        # (AppState.session_id may be None if never explicitly set).
+        resolved_session_id = (
+            prev.session_id or new_tasks[task_id].identity.parent_session_id
+        )
+        needs_bootstrap = (
+            new_tasks[task_id].retain
+            and not new_tasks[task_id].disk_loaded
+            and bool(resolved_session_id)
+            and new_tasks[task_id].identity
+        )
+        if needs_bootstrap:
+            from claude_code_py.storage.session import (
+                read_agent_transcript,
+                bootstrap_agent_messages,
+            )
+            disk_messages = read_agent_transcript(
+                resolved_session_id,
+                new_tasks[task_id].identity.agent_id,
+                getattr(prev, "cwd", None),
+            )
+            if disk_messages:
+                merged = bootstrap_agent_messages(
+                    new_tasks[task_id].messages, disk_messages
+                )
+                new_tasks[task_id] = replace(
+                    new_tasks[task_id],
+                    messages=merged,
+                    disk_loaded=True,
+                )
+            else:
+                new_tasks[task_id] = replace(
+                    new_tasks[task_id], disk_loaded=True
+                )
 
         return replace(
             prev,
@@ -210,44 +272,31 @@ def step_teammate_selection(
 
 
 def _release_task(task: InProcessTeammateTaskState) -> InProcessTeammateTaskState:
-    """Release task back to stub form."""
-    # Create new state with retain=False and messages cleared
-    return InProcessTeammateTaskState(
-        id=task.id,
-        type=task.type,
-        status=task.status,
-        description=task.description,
-        identity=task.identity,
-        prompt=task.prompt,
-        abort_controller=task.abort_controller,
-        tool_use_id=task.tool_use_id,
-        start_time=task.start_time,
-        end_time=task.end_time,
-        output_file=task.output_file,
-        output_offset=task.output_offset,
-        notified=task.notified,
-        model=task.model,
-        awaiting_plan_approval=task.awaiting_plan_approval,
-        permission_mode=task.permission_mode,
-        is_idle=task.is_idle,
-        shutdown_requested=task.shutdown_requested,
-        error=task.error,
-        spinner_verb=task.spinner_verb,
-        past_tense_verb=task.past_tense_verb,
-        last_reported_tool_count=task.last_reported_tool_count,
-        last_reported_token_count=task.last_reported_token_count,
-        token_count=task.token_count,
-        color=task.color,
-        pending_user_messages=[],
-        messages=[],  # Clear messages
+    """Release task back to stub form.
+
+    Drops retain, clears messages to stub, resets disk_loaded. For terminal
+    tasks, sets evict_after so the row lingers for PANEL_GRACE_MS before eviction.
+    Matches TypeScript release() in teammateViewHelpers.ts.
+    """
+    return replace(
+        task,
+        retain=False,
+        messages=[],
+        disk_loaded=False,
+        evict_after=(
+            time.time() + PANEL_GRACE_MS / 1000.0
+            if _is_terminal_task_status(task.status)
+            else None
+        ),
     )
 
 
 def _set_retain(task: InProcessTeammateTaskState, retain: bool) -> InProcessTeammateTaskState:
-    """Set retain flag on task (conceptually - we just return the task as-is for now)."""
-    # In Python, we don't have a retain field yet, but we can add it
-    # For now, just return the task
-    return task
+    """Set retain flag on task. When retain=True, clears evict_after to keep visible."""
+    updates = {"retain": retain}
+    if retain:
+        updates["evict_after"] = None
+    return replace(task, **updates)
 
 
 # =============================================================================
@@ -336,8 +385,25 @@ class TeammateViewUI:
 
         lines = []
         for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            # Handle both Pydantic Message objects (AssistantMessage, UserMessage)
+            # and raw dicts (demo/test code, disk-loaded messages)
+            if hasattr(msg, "type") and hasattr(msg, "message"):
+                # Pydantic Message object
+                role = msg.message.get("role", msg.type)
+                content = msg.message.get("content", "")
+            elif isinstance(msg, dict):
+                # Raw dict — two shapes:
+                # 1. Serialized Pydantic: {type, message: {role, content}}
+                # 2. Flat (injected user msgs): {role, content}
+                inner = msg.get("message")
+                if isinstance(inner, dict) and "role" in inner:
+                    role = inner.get("role", msg.get("type", "unknown"))
+                    content = inner.get("content", "")
+                else:
+                    role = msg.get("role") or msg.get("type", "unknown")
+                    content = msg.get("content", "")
+            else:
+                continue
 
             # Handle content blocks
             if isinstance(content, list):

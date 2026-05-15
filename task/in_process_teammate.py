@@ -84,6 +84,15 @@ class InProcessTeammateTaskState:
     # - current_work_abort_controller (work): Stops current turn only (Escape key)
     current_work_abort_controller: Optional[AbortController] = None
 
+    # View lifecycle (TypeScript: LocalAgentTaskState)
+    # retain=True blocks eviction, enables stream-append to messages, triggers disk bootstrap
+    retain: bool = False
+    # Bootstrap has read the sidechain JSONL and UUID-merged into messages. One-shot per retain cycle.
+    disk_loaded: bool = False
+    # Panel visibility deadline. None = no deadline (running or retained); timestamp = hide after.
+    # Set on release for terminal tasks (now + PANEL_GRACE_MS); set to 0 for immediate dismiss.
+    evict_after: Optional[float] = None
+
 
 @dataclass
 class InProcessSpawnConfig:

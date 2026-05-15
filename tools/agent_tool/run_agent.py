@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, AsyncIterator, Callable, Optional, TYPE_CHECKING
 
 # Debug flag - controlled by environment variable CLAUDE_CODE_DEBUG_TEAMMATE
 DEBUG_AGENT_RUNNER = os.environ.get("CLAUDE_CODE_DEBUG_TEAMMATE", "").lower() in ("1", "true", "yes")
@@ -32,6 +32,67 @@ if TYPE_CHECKING:
     from claude_code_py.tool.context import ToolUseContext
     from claude_code_py.core_types.message import Message
     from .types import AgentDefinition
+
+
+# =============================================================================
+# Background Agent Notification Queue
+# =============================================================================
+# Module-level queue so background tasks can push completed results and the
+# main query loop can drain them between turns, injecting <task-notification>
+# messages into the parent conversation.
+
+_background_notifications: list[dict] = []
+
+
+def enqueue_background_notification(
+    agent_id: str,
+    description: str,
+    status: str,
+    output: str,
+    duration_ms: int = 0,
+) -> None:
+    """Push a background agent completion notification onto the queue.
+
+    Called by _run_agent_background_task when it finishes (success or error).
+    The main query loop drains this queue between turns.
+    """
+    _background_notifications.append({
+        "agent_id": agent_id,
+        "description": description,
+        "status": status,
+        "output": output,
+        "duration_ms": duration_ms,
+    })
+    _debug_print(
+        f"NOTIFICATION enqueued: agent={agent_id}, status={status}, "
+        f"duration={duration_ms}ms, queue_depth={len(_background_notifications)}"
+    )
+
+
+def drain_background_notifications() -> list[dict]:
+    """Drain all pending background agent notifications.
+
+    Called from the main query loop between turns. Returns a copy so the
+    caller owns the list and the module-level queue is cleared.
+    """
+    if not _background_notifications:
+        return []
+    drained = list(_background_notifications)
+    _background_notifications.clear()
+    _debug_print(f"NOTIFICATIONS drained: {len(drained)} items")
+    return drained
+
+
+def format_task_notification(notification: dict) -> str:
+    """Format a notification dict as <task-notification> XML."""
+    return (
+        f'<task-notification>\n'
+        f'  <task-id>{notification["agent_id"]}</task-id>\n'
+        f'  <status>{notification["status"]}</status>\n'
+        f'  <summary>{notification["description"]}</summary>\n'
+        f'  <result>{notification["output"]}</result>\n'
+        f'</task-notification>'
+    )
 
 
 @dataclass
@@ -66,7 +127,6 @@ class AgentRunResult:
     error: Optional[str] = None
     duration_ms: int = 0
     token_usage: Optional[dict[str, int]] = None
-    output_file: Optional[str] = None  # For background agents
 
 
 @dataclass
@@ -132,13 +192,13 @@ class AgentRunner:
             if config.run_in_background:
                 _debug_print("→ Running in background mode")
                 result = await self._run_agent_background(config)
+                # background: duration is tracked by _run_agent_sync internally,
+                # stored in self._agent_results[agent_id] when the task completes.
             else:
                 _debug_print("→ Running in foreground (sync) mode")
                 result = await self._run_agent_sync(config)
-
-            # Calculate duration
-            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            result.duration_ms = duration_ms
+                duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
+                result.duration_ms = duration_ms
 
             # Store result
             self._agent_results[config.agent_id] = result
@@ -147,7 +207,7 @@ class AgentRunner:
             _debug_print("AgentRunner.run_agent: COMPLETED")
             _debug_print(f"  agent_id: '{config.agent_id}'")
             _debug_print(f"  status: '{result.status}'")
-            _debug_print(f"  duration_ms: {duration_ms}")
+            _debug_print(f"  duration_ms: {result.duration_ms}")
             if result.error:
                 _debug_print(f"  error: '{result.error}'")
             _debug_print("=" * 70)
@@ -173,8 +233,101 @@ class AgentRunner:
             # Cleanup progress callback
             self._progress_callbacks.pop(config.agent_id, None)
 
+    async def run_agent_stream(self, config: AgentRunConfig) -> AsyncIterator["Message"]:
+        """Run agent as streaming async generator.
+
+        Yields each message as it arrives from the query loop, enabling
+        real-time sidechain writes and progress updates.
+        Matches TypeScript runAgent.ts for-await-of + yield pattern.
+
+        Yields:
+            Each Message from the agent's query loop
+        """
+        _debug_print("→ run_agent_stream: Starting")
+        from claude_code_py.engine.query import query, QueryParams
+        from claude_code_py.tool.context import (
+            ToolUseContext,
+            ToolUseContextOptions,
+            create_default_tool_use_context,
+        )
+        from claude_code_py.utils.abort_controller import AbortController
+
+        # Handle worktree isolation
+        worktree_info = None
+        if config.isolation == "worktree":
+            from claude_code_py.utils.worktree import create_agent_worktree
+
+            worktree_info = await create_agent_worktree(
+                agent_id=config.agent_id,
+                agent_type=config.agent_type,
+                description=config.description,
+            )
+
+        # Determine working directory
+        cwd = config.cwd or worktree_info.get("worktree_path") if worktree_info else config.cwd or "."
+        _debug_print(f"   Working directory: '{cwd}'")
+
+        # Get tools for agent
+        tools = self._get_agent_tools(config)
+
+        # Use external abort controller if provided, otherwise create one
+        abort_controller = config.abort_controller or AbortController()
+
+        # Create tool use context
+        tool_use_context = create_default_tool_use_context(
+            tools=tools,
+            abort_controller=abort_controller,
+            cwd=cwd,
+        )
+        tool_use_context.agent_id = config.agent_id
+        tool_use_context.agent_type = config.agent_type
+
+        # Build messages for agent
+        messages = self._build_agent_messages(config)
+
+        # Determine query_source
+        builtin_agent_types = {'general-purpose', 'Explore', 'Plan', 'verification', 'code-improver'}
+        is_builtin = config.agent_type in builtin_agent_types
+        query_source = f"agent:builtin:{config.agent_type}" if is_builtin else "agent:custom"
+
+        # Create query params
+        params = QueryParams(
+            messages=messages,
+            system_prompt=config.system_prompt or "",
+            user_context={},
+            system_context={},
+            can_use_tool=agent_can_use_tool,
+            tool_use_context=tool_use_context,
+            fallback_model=config.model,
+            max_turns=config.max_turns,
+            query_source=query_source,
+        )
+
+        try:
+            _debug_print("   → Running streaming query loop...")
+            async for event in query(params):
+                yield event
+            _debug_print("   ✅ Streaming query loop completed")
+        finally:
+            if worktree_info and config.isolation == "worktree":
+                from claude_code_py.utils.worktree import remove_agent_worktree, has_worktree_changes
+                git_root = worktree_info.get("git_root")
+                worktree_branch = worktree_info.get("worktree_branch")
+                head_commit = worktree_info.get("head_commit")
+                should_remove = True
+                if head_commit:
+                    has_changes = await has_worktree_changes(
+                        worktree_info["worktree_path"], head_commit,
+                    )
+                    should_remove = not has_changes
+                if should_remove:
+                    await remove_agent_worktree(
+                        worktree_info["worktree_path"], worktree_branch, git_root,
+                    )
+
     async def _run_agent_sync(self, config: AgentRunConfig) -> AgentRunResult:
         """Run agent synchronously (foreground)."""
+        _sync_start = datetime.now()
         _debug_print("→ _run_agent_sync: Starting")
 
         # Import here to avoid circular dependency
@@ -298,11 +451,13 @@ class AgentRunner:
             _debug_print(f"   Output length: {len(output)} chars")
             _debug_print(f"   Output preview: '{output[:100]}{'...' if len(output) > 100 else ''}'")
 
+            duration_ms = int((datetime.now() - _sync_start).total_seconds() * 1000)
             return AgentRunResult(
                 agent_id=config.agent_id,
                 status="completed",
                 output=output,
                 messages=result_messages,
+                duration_ms=duration_ms,
             )
         finally:
             # Cleanup worktree if created
@@ -339,55 +494,49 @@ class AgentRunner:
         """Run agent in background.
 
         Uses create_task_with_yield to ensure the background agent starts
-        immediately, solving the "create_task doesn't start until next iteration" problem.
+        immediately. Result is stored in self._agent_results[agent_id].
         """
-        # Create output file path
-        output_dir = Path(os.environ.get("CLAUDE_CODE_OUTPUT_DIR", ".claude/output"))
-        output_file = output_dir / f"agent_{config.agent_id}.json"
-
-        # Ensure output directory exists
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create background task with immediate execution guarantee
         task = await create_task_with_yield(
-            self._run_agent_background_task(config, output_file)
+            self._run_agent_background_task(config)
         )
         self._running_agents[config.agent_id] = task
 
         return AgentRunResult(
             agent_id=config.agent_id,
             status="async_launched",
-            output_file=str(output_file),
         )
 
     async def _run_agent_background_task(
         self,
         config: AgentRunConfig,
-        output_file: Path,
     ) -> None:
-        """Background task that runs agent and writes result to file."""
+        """Background task that runs agent and stores the result in memory."""
         try:
             result = await self._run_agent_sync(config)
-
-            # Write result to file
-            result_data = {
-                "agent_id": result.agent_id,
-                "status": result.status,
-                "output": result.output,
-                "duration_ms": result.duration_ms,
-                "timestamp": datetime.now().isoformat(),
-            }
-            output_file.write_text(json.dumps(result_data, indent=2))
-
+            self._agent_results[config.agent_id] = result
+            enqueue_background_notification(
+                agent_id=config.agent_id,
+                description=config.description,
+                status=result.status,
+                output=result.output or "",
+                duration_ms=result.duration_ms,
+            )
         except Exception as e:
-            # Write error to file
-            error_data = {
-                "agent_id": config.agent_id,
-                "status": "error",
-                "error": str(e),
-                "timestamp": datetime.now().isoformat(),
-            }
-            output_file.write_text(json.dumps(error_data, indent=2))
+            import traceback
+            _debug_print(f"BACKGROUND AGENT ERROR [{config.agent_id}]: {e}\n{traceback.format_exc()}")
+            error_result = AgentRunResult(
+                agent_id=config.agent_id,
+                status="error",
+                error=str(e),
+            )
+            self._agent_results[config.agent_id] = error_result
+            enqueue_background_notification(
+                agent_id=config.agent_id,
+                description=config.description,
+                status="error",
+                output=str(e),
+                duration_ms=0,
+            )
 
     def _build_agent_messages(self, config: AgentRunConfig) -> list["Message"]:
         """Build initial messages for agent.
@@ -432,36 +581,45 @@ class AgentRunner:
     def _extract_output(self, messages: list) -> str:
         """Extract output from agent messages.
 
-        Handles both Pydantic Message objects and raw dicts.
+        Scans all assistant messages (not just the last one) for text content.
+        Falls back to listing tool_use blocks if no text was produced.
         """
-        # Find last assistant message
+        tool_names: list[str] = []
+
         for msg in reversed(messages):
-            # Handle Pydantic Message objects (AssistantMessage, UserMessage)
-            if hasattr(msg, "type") and hasattr(msg, "message"):
-                if msg.type == "assistant":
-                    content = msg.message.get("content", "")
-                    if isinstance(content, str):
-                        return content
-                    elif isinstance(content, list):
-                        # Extract text blocks
-                        texts = []
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                texts.append(block.get("text", ""))
-                        return "\n".join(texts)
-            # Handle raw dicts (fallback)
-            elif isinstance(msg, dict):
-                if msg.get("role") == "assistant":
+            if not hasattr(msg, "type") or not hasattr(msg, "message"):
+                # Raw dict fallback
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
                     content = msg.get("content", "")
                     if isinstance(content, str):
                         return content
-                    elif isinstance(content, list):
-                        # Extract text blocks
-                        texts = []
+                    if isinstance(content, list):
                         for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
+                            if isinstance(block, dict):
+                                if block.get("type") == "text":
+                                    return block.get("text", "")
+                                if block.get("type") == "tool_use":
+                                    tool_names.append(block.get("name", "unknown"))
+                continue
+
+            if msg.type == "assistant":
+                content = msg.message.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    texts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
                                 texts.append(block.get("text", ""))
+                            elif block.get("type") == "tool_use":
+                                tool_names.append(block.get("name", "unknown"))
+                    if texts:
                         return "\n".join(texts)
+
+        # No text found — report what tools were used instead of returning empty
+        if tool_names:
+            return f"[Agent executed tools: {', '.join(reversed(tool_names))}]"
         return ""
 
     def _emit_progress(self, agent_id: str, message: str, tool_use: Optional[str] = None) -> None:
@@ -735,6 +893,26 @@ async def run_agent(
     """
     runner = get_agent_runner()
     return await runner.run_agent(config, on_progress)
+
+
+async def run_agent_stream(
+    config: AgentRunConfig,
+) -> AsyncIterator["Message"]:
+    """Run an agent as a streaming async generator.
+
+    Yields each message as it arrives from the query loop, enabling
+    real-time sidechain writes and progress updates.
+    Matches TypeScript runAgent.ts for-await-of + yield pattern.
+
+    Args:
+        config: Agent run configuration
+
+    Yields:
+        Each Message from the agent's query loop
+    """
+    runner = get_agent_runner()
+    async for msg in runner.run_agent_stream(config):
+        yield msg
 
 
 def stop_agent(agent_id: str) -> bool:

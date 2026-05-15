@@ -166,6 +166,75 @@ def get_agent_metadata_path(session_id: str, agent_id: str, cwd: Optional[str] =
     return get_agent_transcript_path(session_id, agent_id, cwd).with_suffix(".meta.json")
 
 
+def read_agent_transcript(
+    session_id: str,
+    agent_id: str,
+    cwd: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Read an agent's JSONL transcript from disk.
+
+    Each line is a JSON object representing one message.
+    Returns empty list if the transcript file doesn't exist or is unreadable.
+
+    Args:
+        session_id: Session identifier
+        agent_id: Agent identifier
+        cwd: Working directory
+
+    Returns:
+        List of message dicts from the transcript file
+    """
+    path = get_agent_transcript_path(session_id, agent_id, cwd)
+    messages: list[dict[str, Any]] = []
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        messages.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return messages
+
+
+def bootstrap_agent_messages(
+    live_messages: list[dict[str, Any]],
+    disk_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge disk transcript with live messages, deduplicating by UUID.
+
+    Disk-write-before-yield guarantees live messages are always a suffix of
+    disk, so disk messages come first. UUID-based dedup prevents duplicates
+    from messages that were written to disk before being streamed.
+
+    Matches TypeScript disk bootstrap logic in REPL.tsx (lines 655-664).
+
+    Args:
+        live_messages: Messages already in task.messages
+        disk_messages: Messages read from disk JSONL
+
+    Returns:
+        Merged list: disk-only messages first, then all live messages
+    """
+    # Helper to safely get uuid from either Pydantic or dict messages
+    def _get_uuid(m: Any) -> str:
+        if hasattr(m, "uuid"):
+            return m.uuid or ""
+        elif isinstance(m, dict):
+            return m.get("uuid", "")
+        return ""
+
+    live_uuids: set[str] = set()
+    for m in live_messages:
+        uid = _get_uuid(m)
+        if uid:
+            live_uuids.add(uid)
+
+    disk_only = [m for m in disk_messages if _get_uuid(m) not in live_uuids]
+    return disk_only + live_messages
+
+
 def get_session_env_dir(session_id: str) -> Path:
     """Get the directory for session environment scripts.
 

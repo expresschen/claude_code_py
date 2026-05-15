@@ -186,8 +186,10 @@ async def spawn_teammate(
     color = input.color or _assign_color(agent_id)
     _debug_print(f"✅ Color assigned: color='{color}' for agent_id='{agent_id}'")
 
-    # Step e: Get parent session ID
-    parent_session_id = get_session_id() or "default"
+    # Step e: Get parent session ID. Generate a UUID if no session exists
+    # so agent sidechain transcripts don't collide under "default".
+    import uuid as _uuid
+    parent_session_id = get_session_id() or str(_uuid.uuid4())
     _debug_print(f"✅ Parent session ID: '{parent_session_id}'")
 
     # Step f: Get cwd from context
@@ -204,6 +206,17 @@ async def spawn_teammate(
         _debug_print(f"   Using fallback cwd: '{cwd}'")
 
     # Step g: Build SpawnTeammateConfig
+    # Look up the agent definition to inherit disallowed_tools and max_turns
+    _agent_disallowed: list[str] = []
+    _agent_max_turns: Optional[int] = None
+    if input.agent_type:
+        from .builtin_agents import get_built_in_agents
+        for agent in get_built_in_agents():
+            if agent.agent_type == input.agent_type:
+                _agent_disallowed = agent.disallowed_tools or []
+                _agent_max_turns = agent.max_turns
+                break
+
     spawn_config = SpawnTeammateConfig(
         name=input.name,
         team_name=input.team_name,
@@ -216,6 +229,8 @@ async def spawn_teammate(
         tool_use_id=input.tool_use_id,
         agent_type=input.agent_type,
         cwd=cwd,
+        disallowed_tools=_agent_disallowed,
+        max_turns=_agent_max_turns,
     )
     _debug_print("✅ SpawnTeammateConfig built")
 

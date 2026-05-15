@@ -548,7 +548,6 @@ def add_pending_user_message(
 
 
 @dataclass
-@dataclass
 class SpawnTeammateConfig:
     """Configuration for spawning an in-process teammate (Task V2).
 
@@ -567,6 +566,8 @@ class SpawnTeammateConfig:
     tool_use_id: Optional[str] = None  # Tool use ID for correlation
     agent_type: Optional[str] = None  # Optional agent type specifier
     cwd: Optional[str] = None  # Working directory for teammate
+    disallowed_tools: Optional[list[str]] = None  # Tools to exclude (from agent definition)
+    max_turns: Optional[int] = None  # Max turns (from agent definition)
 
 
 @dataclass
@@ -713,6 +714,9 @@ async def spawn_in_process_teammate_v2(
             description=config.description,
             teammate_context=teammate_context,
             model=config.model,
+            agent_type=config.agent_type,
+            disallowed_tools=config.disallowed_tools,
+            max_turns=config.max_turns,
         )
         _debug_print(f"         InProcessRunnerConfig built")
 

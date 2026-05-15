@@ -196,7 +196,7 @@ READ_ONLY_DISALLOWED_TOOLS = [
 GENERAL_PURPOSE_AGENT = BuiltInAgentDefinition(
     agent_type="general-purpose",
     when_to_use="General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries use this agent to perform the search for you.",
-    tools=["*"],  # All tools available
+    disallowed_tools=[AGENT_TOOL_NAME],  # Subagents cannot spawn further agents
     get_system_prompt=get_general_purpose_system_prompt,
 )
 

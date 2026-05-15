@@ -208,6 +208,21 @@ async def query(
                         state.messages.remove(message)
                         break  # Process one notification per iteration
 
+            # Drain background agent completion notifications and inject them
+            # as user-visible messages so the parent agent sees the results.
+            # Lazy import to avoid circular dependency.
+            from claude_code_py.tools.agent_tool.run_agent import (
+                drain_background_notifications,
+                format_task_notification,
+            )
+            for notification in drain_background_notifications():
+                notification_text = format_task_notification(notification)
+                notification_msg = UserMessage(
+                    message={"role": "user", "content": notification_text}
+                )
+                state.messages.append(notification_msg)
+                yield notification_msg
+
             # NEW: Apply microcompact BEFORE autocompact (moved from auto_compact_if_needed)
             async for event in _check_microcompact(params, state):
                 yield event

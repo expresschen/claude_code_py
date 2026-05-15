@@ -92,7 +92,6 @@ class AgentOutput:
     description: Optional[str] = None
     prompt: Optional[str] = None
     output: Optional[str] = None
-    output_file: Optional[str] = None
     duration_ms: int = 0
 
 
@@ -137,6 +136,15 @@ class AgentTool(Tool[AgentInput, AgentOutput, dict[str, Any]]):
         Returns:
             Tool result with agent output
         """
+        # Recursion guard: prevent agent nesting.
+        # When context.agent_id is set, we are already inside a subagent.
+        # Allowing further Agent calls leads to unbounded cascading spawns.
+        if context.agent_id is not None:
+            raise ToolError(
+                "Cannot spawn a subagent from within another subagent. "
+                "Complete the current task using your own tools directly."
+            )
+
         # Teammate spawn path - when team_name and name are provided
         if args.team_name and args.name:
             from .spawn_teammate import spawn_teammate, SpawnTeammateInput
@@ -224,7 +232,6 @@ class AgentTool(Tool[AgentInput, AgentOutput, dict[str, Any]]):
             description=args.description,
             prompt=args.prompt,
             output=result.output,
-            output_file=result.output_file,
             duration_ms=result.duration_ms,
         )
 

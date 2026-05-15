@@ -1212,7 +1212,9 @@ class REPL:
                 return prev
 
             self._store.set_state(add_message)
-            self._console.print("[green]✓ Message sent to teammate[/green]")
+
+            # Poll for agent response and display new messages
+            await self._poll_agent_response(viewed_task)
             return
 
         # Normal processing - leader handles the message
@@ -1406,16 +1408,109 @@ class REPL:
             if task.identity.agent_name == agent_name:
                 enter_teammate_view(task.id, self._store.set_state)
 
-                # Render the view
+                # Re-read state to get bootstrapped messages
+                updated_state = self._store.get_state()
+                updated_task = updated_state.tasks.get(task.id)
+
+                # Render the view with bootstrapped messages
                 ui = TeammateViewUI(self._console)
                 self._console.print("\n")
-                self._console.print(ui.render_full_view(task))
-                self._console.print("\n[dim]Press Enter to send message, /exit-view to return to leader[/dim]")
+                if updated_task:
+                    self._console.print(ui.render_full_view(updated_task))
+                else:
+                    self._console.print(ui.render_full_view(task))
+                self._console.print("\n[dim]Type your message to send, /exit-view to return to leader, Esc to go back[/dim]")
                 return True
 
         self._console.print(f"[red]Agent '{agent_name}' not found[/red]")
         self._console.print(f"[dim]Available agents: {', '.join(t.identity.agent_name for t in teammates)}[/dim]")
         return True
+
+    async def _poll_agent_response(self, viewed_task) -> None:
+        """Poll the viewed agent for new response messages.
+
+        After injecting a user message to a viewed teammate, poll task.messages
+        for new assistant responses. Display new messages as they arrive.
+        Break when the teammate goes idle (response complete) or on Escape.
+
+        Args:
+            viewed_task: The InProcessTeammateTaskState being viewed
+        """
+        import asyncio
+        from claude_code_py.ui.teammate_view import TeammateViewUI
+
+        ui = TeammateViewUI(self._console)
+        seen_count = len(viewed_task.messages)
+        poll_interval = 0.3  # seconds
+        max_polls = 300  # ~90 seconds timeout
+        poll_count = 0
+
+        self._console.print("[dim]Waiting for response... (Esc to stop waiting)[/dim]")
+
+        while poll_count < max_polls:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+
+            # Re-read task state (AppState may have been updated by runner)
+            state = self._store.get_state()
+            task = state.tasks.get(viewed_task.id)
+            if not task:
+                break
+
+            # Check for new messages
+            current_msgs = getattr(task, 'messages', []) or []
+            new_msgs = current_msgs[seen_count:]
+            if new_msgs:
+                for msg in new_msgs:
+                    # Handle both Pydantic Message objects and raw dicts
+                    if hasattr(msg, "type") and hasattr(msg, "message"):
+                        role = msg.message.get("role", msg.type)
+                        content = msg.message.get("content", "")
+                    elif isinstance(msg, dict):
+                        # Two shapes: serialized Pydantic ({message: {role, content}})
+                        # or flat injected user msgs ({role, content})
+                        inner = msg.get("message")
+                        if isinstance(inner, dict) and "role" in inner:
+                            role = inner.get("role", msg.get("type", "unknown"))
+                            content = inner.get("content", "")
+                        else:
+                            role = msg.get("role") or msg.get("type", "unknown")
+                            content = msg.get("content", "")
+                    else:
+                        continue
+                    if isinstance(content, list):
+                        # Handle content blocks (tool_use, tool_result, etc.)
+                        text_parts = []
+                        for block in content:
+                            if isinstance(block, dict):
+                                if block.get("type") == "text":
+                                    text_parts.append(block.get("text", ""))
+                                elif block.get("type") == "tool_use":
+                                    text_parts.append(f"[tool: {block.get('name', '?')}]")
+                                elif block.get("type") == "tool_result":
+                                    text_parts.append("[tool result]")
+                            else:
+                                text_parts.append(str(block))
+                        content = " ".join(text_parts)
+                    if role == "assistant":
+                        self._console.print(f"\n[bold green]@{task.identity.agent_name}:[/bold green] {content}")
+                    elif role == "user":
+                        self._console.print(f"\n[bold blue]You:[/bold blue] {content}")
+                seen_count = len(current_msgs)
+
+            # Check if teammate is idle (response complete)
+            is_idle = getattr(task, 'is_idle', False)
+            status = getattr(task, 'status', 'running')
+            if is_idle or status in ('completed', 'killed', 'failed', 'error'):
+                break
+
+            # Check for Escape press (non-blocking poll)
+            if self._interrupt_event.is_set():
+                self._interrupt_event.clear()
+                self._console.print("\n[dim]Stopped waiting[/dim]")
+                break
+
+        self._console.print()
 
     def _handle_exit_view_command(self) -> bool:
         """Handle /exit-view command to return to leader view."""
