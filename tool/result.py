@@ -139,6 +139,26 @@ class TimeoutError(ToolError):
         self.timeout_seconds = timeout_seconds
 
 
+class ShellError(ToolError):
+    """Shell command failed with non-zero exit code."""
+
+    def __init__(
+        self,
+        stdout: str = "",
+        stderr: str = "",
+        exit_code: int = 1,
+        interrupted: bool = False,
+    ):
+        super().__init__(
+            f"Shell command failed (exit code {exit_code})",
+            is_retryable=False,
+        )
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+        self.interrupted = interrupted
+
+
 class SandboxError(ToolError):
     """Sandbox-related error."""
 

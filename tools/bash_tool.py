@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from claude_code_py.tool.base import Tool, build_tool
 from claude_code_py.tool.context import ToolUseContext
-from claude_code_py.tool.result import ToolResult, ToolError
+from claude_code_py.tool.result import ToolResult, ToolError, ShellError, TimeoutError
 
 
 class BashInput(BaseModel):
@@ -98,21 +98,30 @@ class BashTool(Tool[BashInput, BashOutput, dict[str, Any]]):
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-                raise TimeoutError(
-                    f"Command timed out after {timeout}ms"
+                raise TimeoutError(timeout_seconds=timeout / 1000)
+
+            exit_code = process.returncode or 0
+            stdout_str = stdout.decode("utf-8", errors="replace")
+            stderr_str = stderr.decode("utf-8", errors="replace")
+
+            if exit_code != 0:
+                raise ShellError(
+                    stdout=stdout_str,
+                    stderr=stderr_str,
+                    exit_code=exit_code,
                 )
 
             output = BashOutput(
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
-                exit_code=process.returncode or 0,
+                stdout=stdout_str,
+                stderr=stderr_str,
+                exit_code=exit_code,
             )
 
             return ToolResult(data=output)
 
+        except (TimeoutError, ShellError):
+            raise
         except Exception as e:
-            if isinstance(e, TimeoutError):
-                raise
             raise ToolError(f"Command execution failed: {e}")
 
     async def description(

@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from claude_code_py.tool.base import Tool
 from claude_code_py.tool.context import ToolUseContext
-from claude_code_py.tool.result import ToolResult
+from claude_code_py.tool.result import ToolResult, ToolError
 from claude_code_py.utils.team.team_file import (
     write_team_file,
     read_team_file,
@@ -285,7 +285,7 @@ Do NOT shutdown prematurely. Ensure all tasks are truly complete before sending 
         existing_team = team_context.get("teamName") if team_context else None
 
         if existing_team:
-            raise ValueError(
+            raise ToolError(
                 f"Already leading team '{existing_team}'. "
                 "Use TeamDelete to end the current team before creating a new one."
             )

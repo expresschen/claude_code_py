@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -127,10 +128,6 @@ class AskUserQuestionTool(Tool[AskUserQuestionInput, AskUserQuestionOutput, dict
     max_result_size_chars = 50_000
     search_hint = "ask the user a multiple-choice question"
 
-    # Pending questions storage (for async UI handling)
-    _pending_questions: Optional[AskUserQuestionInput] = None
-    _pending_answers: Optional[dict[str, str]] = None
-
     async def call(
         self,
         args: AskUserQuestionInput,
@@ -174,24 +171,13 @@ class AskUserQuestionTool(Tool[AskUserQuestionInput, AskUserQuestionOutput, dict
         if agent_name and team_name and not is_team_lead():
             return await self._call_as_teammate(args, agent_name, team_name)
 
-        # Store pending questions for UI to handle
-        self._pending_questions = args
-
-        # In a real implementation, this would block until user responds
-        # For now, we return a placeholder indicating questions are pending
-        # The actual answers would come from a user interaction callback
-
-        # Simulate getting answers (placeholder)
-        # In production: await user_response_callback()
-        default_answers = {}
-        for q in args.questions:
-            # Default to first option as placeholder
-            if q.options:
-                default_answers[q.question] = q.options[0].label
+        # Interactive: display questions and wait for user input
+        answers, annotations = await _ask_questions_interactive(args.questions)
 
         output = AskUserQuestionOutput(
             questions=[q.model_dump() for q in args.questions],
-            answers=default_answers,
+            answers=answers,
+            annotations=annotations if annotations else None,
         )
 
         return ToolResult(data=output)
@@ -332,17 +318,133 @@ class AskUserQuestionTool(Tool[AskUserQuestionInput, AskUserQuestionOutput, dict
         """Requires user interaction."""
         return True
 
-    def get_pending_questions(self) -> Optional[AskUserQuestionInput]:
-        """Get pending questions (for UI)."""
-        return self._pending_questions
-
-    def set_answers(self, answers: dict[str, str]) -> None:
-        """Set answers from user response."""
-        self._pending_answers = answers
-
 
 # Create instance
 ask_user_question_tool = AskUserQuestionTool()
+
+
+async def _ask_questions_interactive(
+    questions: list[Question],
+) -> tuple[dict[str, str], Optional[dict[str, QuestionAnnotation]]]:
+    """Display questions in terminal and collect user answers.
+
+    For each question, shows options and waits for user selection.
+    Supports both single-select and multi-select questions.
+    Users can always type custom text ("Other") by entering free text.
+
+    Pauses the Rich Live status display for the entire session so that
+    console output and readline echo are not disrupted by background
+    rendering. async_input handles its own nested pause/resume of the
+    display and the EscapeInput raw-mode listener.
+
+    Args:
+        questions: List of Question objects
+
+    Returns:
+        Tuple of (answers dict, annotations dict)
+    """
+    import claude_code_py.main as main_module
+
+    answers: dict[str, str] = {}
+    annotations: dict[str, QuestionAnnotation] = {}
+
+    # Pause Rich Live status display for the entire question session.
+    # pause() uses a counter – nested pause/resume in async_input won't
+    # actually restart the display until our final resume() call.
+    status_display = main_module._status_display_ref
+    if status_display is not None:
+        try:
+            status_display.pause()
+        except Exception:
+            pass
+
+    try:
+        for i, q in enumerate(questions, 1):
+            # Display question header (plain print to avoid Rich escape-code
+            # interference with readline echo)
+            print(f"\n─── [{i}/{len(questions)}] {q.header} ───")
+            print(f"{q.question}")
+
+            # Display options
+            for j, opt in enumerate(q.options, 1):
+                label = opt.label
+                if j == 1:
+                    label += " (Recommended)"
+                print(f"  {j}. {label}")
+                if opt.description:
+                    print(f"     {opt.description}")
+
+            print(f"  (Or type your own answer)")
+
+            if q.multi_select:
+                print(f"  (Multi-select: enter numbers separated by commas, e.g. '1,3')")
+
+            # Get user input using async_input
+            # async_input handles: suspend listener → restore cooked → input() → restore listener
+            while True:
+                try:
+                    response = await main_module.async_input("Your choice")
+                except (EOFError, KeyboardInterrupt):
+                    answers[q.question] = ""
+                    break
+
+                response = response.strip()
+
+                if not response:
+                    print("Please enter a choice.")
+                    continue
+
+                if q.multi_select:
+                    selected_labels = []
+                    parts = response.split(",")
+                    for part in parts:
+                        part = part.strip()
+                        try:
+                            idx = int(part)
+                            if 1 <= idx <= len(q.options):
+                                selected_labels.append(q.options[idx - 1].label)
+                            else:
+                                print(
+                                    f"Invalid choice: {idx}. "
+                                    f"Please enter 1-{len(q.options)}."
+                                )
+                                continue
+                        except ValueError:
+                            selected_labels.append(part)
+
+                    if selected_labels:
+                        answers[q.question] = ", ".join(selected_labels)
+                        annotations[q.question] = QuestionAnnotation(notes=response)
+                        break
+                else:
+                    # Single select
+                    try:
+                        idx = int(response)
+                        if 1 <= idx <= len(q.options):
+                            selected = q.options[idx - 1]
+                            answers[q.question] = selected.label
+                            annotations[q.question] = QuestionAnnotation(
+                                preview=selected.preview,
+                            )
+                            break
+                        else:
+                            print(
+                                f"Invalid choice: {idx}. "
+                                f"Please enter 1-{len(q.options)} or type your own answer."
+                            )
+                    except ValueError:
+                        # Custom text answer ("Other")
+                        answers[q.question] = response
+                        annotations[q.question] = QuestionAnnotation(notes=response)
+                        break
+
+        return answers, annotations
+    finally:
+        if status_display is not None:
+            try:
+                status_display.resume()
+            except Exception:
+                pass
 
 
 def format_questions_for_display(questions: list[Question]) -> str:

@@ -6,6 +6,7 @@ This implements the runTools, runToolsSerially, and runToolsConcurrently functio
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,12 +18,27 @@ from typing import (
 from .partition import partition_tool_calls, get_max_tool_use_concurrency
 from .progress import MessageUpdate, MessageUpdateLazy
 from claude_code_py.core_types.permissions import PermissionBehavior
+from claude_code_py.tool.result import (
+    ToolError,
+    ShellError,
+    TimeoutError as ToolTimeoutError,
+    ValidationError as ToolValidationError,
+    PermissionDeniedError,
+)
+from claude_code_py.utils.abort_controller import AbortError
+from claude_code_py.utils.tool_errors import (
+    format_error,
+    format_validation_error,
+    classify_tool_error,
+)
 
 if TYPE_CHECKING:
     from claude_code_py.tool.base import Tool, ToolCallProgress
     from claude_code_py.tool.context import ToolUseContext, CanUseToolFn
     from claude_code_py.tool.result import ToolResult
     from claude_code_py.core_types.message import AssistantMessage, Message, ToolUseBlock
+
+logger = logging.getLogger(__name__)
 
 
 async def run_tools(
@@ -150,7 +166,13 @@ async def run_tools_concurrently(
     can_use_tool: "CanUseToolFn",
     tool_use_context: "ToolUseContext",
 ) -> AsyncGenerator[MessageUpdateLazy, None]:
-    """Execute tool calls concurrently.
+    """Execute tool calls concurrently with Bash sibling error cascade.
+
+    When a Bash tool produces an error result, all other concurrent tools
+    are cancelled with a synthetic error message. Only Bash errors cascade;
+    read-only tool failures (Read, Glob, etc.) do not affect siblings.
+
+    This mirrors StreamingToolExecutor.ts in the TypeScript implementation.
 
     Args:
         tool_use_messages: Tool use blocks to execute
@@ -161,11 +183,100 @@ async def run_tools_concurrently(
     Yields:
         Message updates from tool execution
     """
-    from claude_code_py.utils.generators import all
+    from claude_code_py.utils.abort_controller import (
+        AbortController,
+        AbortSignal,
+    )
+    from claude_code_py.core_types.message import UserMessage
+
+    # Sibling abort controller: child of the parent tool_use_context abort.
+    # Fires when a Bash tool errors so sibling subprocesses die immediately.
+    # Aborting this does NOT abort the parent — the query loop won't end the turn.
+    sibling_controller = AbortController(
+        parent_signal=tool_use_context.abort_controller.signal,
+    )
+
+    # Track whether a Bash tool has errored (triggers sibling cascade)
+    has_errored = False
+    errored_tool_description = ""
+
+    # Track which tools have already produced their own error
+    # (to avoid giving them a duplicate "sibling error" message)
+    tools_that_errored: set[str] = set()
+
+    # Track which tools are still pending (not yet started or in progress)
+    pending_tool_ids: set[str] = {t.id for t in tool_use_messages}
+
+    BASH_TOOL_NAME = "Bash"
+
+    def _is_error_result(update: MessageUpdateLazy) -> bool:
+        """Check if an update contains an error tool_result."""
+        if not update.message or not hasattr(update.message, "message"):
+            return False
+        msg = update.message.message
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("is_error") is True:
+                    return True
+        return False
+
+    def _get_tool_name_for_id(tool_use_id: str) -> str:
+        """Get tool name from tool use ID."""
+        for t in tool_use_messages:
+            if t.id == tool_use_id:
+                return t.name
+        return ""
+
+    def _get_tool_description(tool_use: "ToolUseBlock") -> str:
+        """Get a human-readable description for a tool use."""
+        name = tool_use.name
+        inp = tool_use.input
+        if name == BASH_TOOL_NAME and isinstance(inp, dict):
+            desc = inp.get("description", "")
+            cmd = inp.get("command", "")
+            if desc:
+                return f"Bash({desc})"
+            if cmd:
+                return f"Bash({cmd[:50]})"
+        return name
+
+    def _create_sibling_error_message(
+        tool_use_id: str,
+    ) -> UserMessage:
+        """Create a synthetic error message for a tool cancelled by sibling error."""
+        desc = errored_tool_description
+        msg = (
+            f"Cancelled: parallel tool call {desc} errored"
+            if desc
+            else "Cancelled: parallel tool call errored"
+        )
+        return UserMessage(
+            message={
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": f"<tool_use_error>{msg}</tool_use_error>",
+                    "is_error": True,
+                }],
+            }
+        )
 
     async def run_one(
         tool_use: "ToolUseBlock",
     ) -> AsyncGenerator[MessageUpdateLazy, None]:
+        nonlocal has_errored, errored_tool_description
+
+        # Check if already cancelled by a sibling error before starting
+        if has_errored and tool_use.id not in tools_that_errored:
+            yield MessageUpdateLazy(
+                message=_create_sibling_error_message(tool_use.id),
+            )
+            _mark_tool_use_complete(tool_use_context, tool_use.id)
+            pending_tool_ids.discard(tool_use.id)
+            return
+
         # Mark as in progress
         if tool_use_context.set_in_progress_tool_use_ids:
             tool_use_context.set_in_progress_tool_use_ids(
@@ -174,21 +285,54 @@ async def run_tools_concurrently(
 
         parent_message = _find_parent_message(assistant_messages, tool_use.id)
 
+        # Execute the tool, checking for sibling abort between yields
+        this_tool_errored = False
         async for update in run_tool_use(
             tool_use,
             parent_message,
             can_use_tool,
             tool_use_context,
         ):
+            # Check if a sibling Bash error occurred while this tool was running
+            if has_errored and not this_tool_errored and tool_use.id not in tools_that_errored:
+                yield MessageUpdateLazy(
+                    message=_create_sibling_error_message(tool_use.id),
+                )
+                break
+
+            # Check if this update is an error result
+            if _is_error_result(update):
+                this_tool_errored = True
+                tools_that_errored.add(tool_use.id)
+
+                # Only Bash errors cancel siblings
+                if tool_use.name == BASH_TOOL_NAME:
+                    has_errored = True
+                    errored_tool_description = _get_tool_description(tool_use)
+                    sibling_controller.abort("sibling_error")
+
             yield update
 
         _mark_tool_use_complete(tool_use_context, tool_use.id)
+        pending_tool_ids.discard(tool_use.id)
 
     # Run all with concurrency limit
+    from claude_code_py.utils.generators import all
+
     generators = [lambda t=tool_use: run_one(t) for tool_use in tool_use_messages]
 
     async for update in all(generators, get_max_tool_use_concurrency()):
         yield update
+
+    # After all concurrent tools complete, emit synthetic errors for any
+    # pending tools that were never started due to sibling error
+    if has_errored:
+        for tool_use_id in list(pending_tool_ids):
+            if tool_use_id not in tools_that_errored:
+                yield MessageUpdateLazy(
+                    message=_create_sibling_error_message(tool_use_id),
+                )
+                _mark_tool_use_complete(tool_use_context, tool_use_id)
 
 
 async def run_tool_use(
@@ -210,11 +354,12 @@ async def run_tool_use(
     """
     from claude_code_py.tool.base import find_tool_by_name
     from claude_code_py.core_types.message import UserMessage
+    from pydantic import ValidationError as PydanticValidationError
 
     tool = find_tool_by_name(tool_use_context.options.tools, tool_use.name)
 
     if not tool:
-        # Tool not found - return error
+        # Tool not found - return error with <tool_use_error> wrapper
         yield MessageUpdateLazy(
             message=UserMessage(
                 message={
@@ -222,7 +367,7 @@ async def run_tool_use(
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_use.id,
-                        "content": f"Error: Tool '{tool_use.name}' not found",
+                        "content": f"<tool_use_error>Error: No such tool available: {tool_use.name}</tool_use_error>",
                         "is_error": True,
                     }],
                 }
@@ -231,11 +376,48 @@ async def run_tool_use(
         return
 
     try:
-        # Parse input
-        if hasattr(tool.input_schema, "model_validate"):
-            parsed_input = tool.input_schema.model_validate(tool_use.input)
-        else:
-            parsed_input = tool.input_schema(**tool_use.input)
+        # Parse input with validation error handling
+        try:
+            if hasattr(tool.input_schema, "model_validate"):
+                parsed_input = tool.input_schema.model_validate(tool_use.input)
+            else:
+                parsed_input = tool.input_schema(**tool_use.input)
+        except PydanticValidationError as e:
+            # Format Pydantic validation errors into human-readable messages
+            content = format_validation_error(tool.name, e)
+            yield MessageUpdateLazy(
+                message=UserMessage(
+                    message={
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": f"<tool_use_error>{content}</tool_use_error>",
+                            "is_error": True,
+                        }],
+                    }
+                )
+            )
+            return
+
+        # Run tool-level validate_input
+        validation_result = await tool.validate_input(parsed_input, tool_use_context)
+        if not validation_result.result:
+            content = validation_result.message or "Input validation failed"
+            yield MessageUpdateLazy(
+                message=UserMessage(
+                    message={
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": f"<tool_use_error>{content}</tool_use_error>",
+                            "is_error": True,
+                        }],
+                    }
+                )
+            )
+            return
 
         # Check permissions
         perm_result = await can_use_tool(
@@ -248,6 +430,7 @@ async def run_tool_use(
 
         if perm_result.behavior != PermissionBehavior.ALLOW:
             # Permission denied
+            reason = perm_result.reason or "No reason provided"
             yield MessageUpdateLazy(
                 message=UserMessage(
                     message={
@@ -255,7 +438,7 @@ async def run_tool_use(
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": tool_use.id,
-                            "content": f"Permission denied: {perm_result.reason or 'No reason provided'}",
+                            "content": f"Permission denied: {reason}",
                             "is_error": True,
                         }],
                     }
@@ -291,8 +474,9 @@ async def run_tool_use(
             } if result.context_modifier else None,
         )
 
-    except Exception as e:
-        # Error executing tool
+    except AbortError as e:
+        # User-initiated abort - not logged as a tool failure
+        content = format_error(e)
         yield MessageUpdateLazy(
             message=UserMessage(
                 message={
@@ -300,7 +484,115 @@ async def run_tool_use(
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_use.id,
-                        "content": f"Error: {str(e)}",
+                        "content": content,
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except ShellError as e:
+        # Shell errors are expected operational errors, not bugs
+        # Don't log via logError, just format and return to model
+        content = format_error(e)
+        logger.debug(f"{tool.name} tool error: {content[:200]}")
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": content,
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except ToolTimeoutError as e:
+        # Timeout errors are retryable
+        content = format_error(e)
+        logger.debug(f"{tool.name} timed out: {content[:200]}")
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": content,
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except ToolValidationError as e:
+        # Tool-level validation error
+        content = format_error(e)
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": f"<tool_use_error>{content}</tool_use_error>",
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except PermissionDeniedError as e:
+        # Permission denied from within tool execution
+        content = format_error(e)
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": content,
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except ToolError as e:
+        # Generic tool error - logged as error
+        content = format_error(e)
+        logger.error(f"{tool.name} tool error: {classify_tool_error(e)}")
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": f"<tool_use_error>Error calling tool ({tool.name}): {content}</tool_use_error>",
+                        "is_error": True,
+                    }],
+                }
+            )
+        )
+
+    except Exception as e:
+        # Catch-all for unexpected errors - always logged
+        content = format_error(e)
+        tool_info = f" ({tool.name})" if tool else ""
+        logger.error(f"Error calling tool{tool_info}: {classify_tool_error(e)}")
+        yield MessageUpdateLazy(
+            message=UserMessage(
+                message={
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": f"<tool_use_error>Error calling tool{tool_info}: {content}</tool_use_error>",
                         "is_error": True,
                     }],
                 }

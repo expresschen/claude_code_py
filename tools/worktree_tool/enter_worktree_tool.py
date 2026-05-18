@@ -82,7 +82,7 @@ class EnterWorktreeToolClass(Tool[EnterWorktreeInput, EnterWorktreeOutput, None]
         """
         # Validate not already in a worktree
         if get_current_worktree_session():
-            raise RuntimeError("Already in a worktree session")
+            raise ToolError("Already in a worktree session")
 
         # Get session ID from context
         session_id = context.options.tool_permission_context.session_id or "default"
@@ -93,7 +93,7 @@ class EnterWorktreeToolClass(Tool[EnterWorktreeInput, EnterWorktreeOutput, None]
                 validate_worktree_slug(args.name)
                 slug = args.name
             except ValueError as e:
-                raise RuntimeError(str(e))
+                raise ToolError(str(e))
         else:
             # Generate random slug
             adjectives = ["swift", "bright", "calm", "keen", "bold"]

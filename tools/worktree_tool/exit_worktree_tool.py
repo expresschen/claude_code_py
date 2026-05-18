@@ -84,7 +84,7 @@ class ExitWorktreeToolClass(Tool[ExitWorktreeInput, ExitWorktreeOutput, None]):
         worktree = get_current_worktree_session()
 
         if not worktree:
-            raise RuntimeError("Not in a worktree session")
+            raise ToolError("Not in a worktree session")
 
         worktree_path = worktree.worktree_path
 
@@ -96,7 +96,7 @@ class ExitWorktreeToolClass(Tool[ExitWorktreeInput, ExitWorktreeOutput, None]):
                     worktree.original_head_commit,
                 )
                 if has_changes:
-                    raise RuntimeError(
+                    raise ToolError(
                         f"Worktree has uncommitted changes or new commits. "
                         f"Use discard_changes=true to force removal, "
                         f"or action='keep' to preserve it."

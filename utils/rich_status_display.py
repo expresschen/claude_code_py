@@ -87,7 +87,7 @@ class TeammateStatusDisplay:
         self._live: Optional[Live] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._paused = False
+        self._pause_count = 0  # Counter for nested pause/resume
         self._spinner_index = 0
         self._lock = threading.Lock()  # Protect Live operations
 
@@ -115,10 +115,10 @@ class TeammateStatusDisplay:
 
                 # Keep updating while running
                 while self._running:
-                    if not self._paused:
+                    if self._pause_count == 0:
                         self._spinner_index = (self._spinner_index + 1) % len(SPINNER_CHARS)
                         with self._lock:
-                            if self._live and not self._paused:
+                            if self._live:
                                 try:
                                     self._live.update(self._generate_table())
                                 except Exception:
@@ -161,38 +161,42 @@ class TeammateStatusDisplay:
     def pause(self) -> None:
         """Pause the display temporarily (e.g., while waiting for input).
 
-        This stops the Live display without stopping the background thread,
-        allowing normal Console output to appear without interference.
+        Uses a counter so nested pause/resume calls work correctly.
+        Only stops the Live display on the first pause (0→1).
         """
-        self._paused = True
-        with self._lock:
-            if self._live:
-                try:
-                    self._live.stop()
-                    self._live = None  # Clear reference, will recreate on resume
-                except Exception:
-                    pass
+        self._pause_count += 1
+        if self._pause_count == 1:
+            with self._lock:
+                if self._live:
+                    try:
+                        self._live.stop()
+                        self._live = None
+                    except Exception:
+                        pass
 
     def resume(self) -> None:
         """Resume the display after pausing.
 
-        Recreate the Live display to show teammate status again.
+        Uses a counter: only recreates and starts Live when all
+        nested pause() calls have been balanced by resume() calls.
         """
-        self._paused = False
-        with self._lock:
-            if not self._live and self._running:
-                try:
-                    self._live = Live(
-                        self._generate_table(),
-                        console=self._console,
-                        refresh_per_second=self._refresh_rate,
-                        transient=True,
-                        vertical_overflow="visible",
-                        auto_refresh=True,
-                    )
-                    self._live.start()
-                except Exception:
-                    pass
+        if self._pause_count > 0:
+            self._pause_count -= 1
+        if self._pause_count == 0:
+            with self._lock:
+                if not self._live and self._running:
+                    try:
+                        self._live = Live(
+                            self._generate_table(),
+                            console=self._console,
+                            refresh_per_second=self._refresh_rate,
+                            transient=True,
+                            vertical_overflow="visible",
+                            auto_refresh=True,
+                        )
+                        self._live.start()
+                    except Exception:
+                        pass
 
     def _generate_table(self) -> Table:
         """Generate the status display table.

@@ -11,6 +11,18 @@ import os
 import sys
 from pathlib import Path
 
+# When this module is run as __main__ (e.g. python -m claude_code_py.main),
+# ensure that imports of claude_code_py.main resolve to the SAME module
+# instance.  Otherwise deferred imports (like the one in
+# tools/ask_user_question/_ask_questions_interactive) create a separate
+# module copy whose module-level globals (_escape_input_handler,
+# _status_display_ref, _cooked_terminal_settings) are all None — which
+# causes async_input to skip suspending the raw-mode listener, skip
+# pausing the Rich Live display, and fall back to a degraded terminal
+# restore, leaving the cursor hidden and the prompt invisible.
+if __name__ == '__main__':
+    sys.modules['claude_code_py.main'] = sys.modules['__main__']
+
 # Configure logging to file only (not console) to avoid interfering with REPL
 # This prevents logs from covering the input prompt
 log_dir = Path.home() / ".claude" / "logs"
@@ -38,6 +50,61 @@ _escape_input_handler: Optional[Any] = None
 # Global reference to status display (set by REPL class, used by async_input)
 _status_display_ref: Optional[Any] = None
 
+# Captured cooked-mode terminal settings for fallback restore.
+# Set on first call to _ensure_terminal_cooked() — must happen before
+# any raw-mode changes are made (i.e. before start_execution_listener).
+_cooked_terminal_settings: Optional[Any] = None
+
+
+def _capture_cooked_settings() -> None:
+    """Capture current terminal settings as the cooked-mode baseline.
+
+    Must be called early in REPL startup, before any raw-mode listener is
+    started, so the captured settings represent proper cooked mode.
+    """
+    global _cooked_terminal_settings
+    try:
+        if sys.stdin.isatty():
+            import termios
+            _cooked_terminal_settings = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        _cooked_terminal_settings = None
+
+
+def _ensure_terminal_cooked() -> None:
+    """Restore terminal to cooked (canonical) mode for input().
+
+    Uses the baseline cooked settings captured by _capture_cooked_settings().
+    If those are unavailable, falls back to OR-ing in essential flags.
+    Without cooked mode, ICRNL is disabled so Enter sends \\r instead of \\n,
+    and input() / readline() hangs forever waiting for \\n. ECHO is also
+    required for the kernel to echo typed characters.
+    """
+    try:
+        if not sys.stdin.isatty():
+            return
+        import termios
+        fd = sys.stdin.fileno()
+
+        if _cooked_terminal_settings is not None:
+            # Full restore: all flags (ICANON, ECHO, ECHOE, ECHOK, IEXTEN,
+            # ICRNL, IXON, BRKINT, ISIG, OPOST, etc.) back to cooked values.
+            termios.tcsetattr(fd, termios.TCSANOW, _cooked_terminal_settings)
+        else:
+            # Degraded fallback: enable only the most critical flags.
+            attrs = termios.tcgetattr(fd)
+            # Input flags: map CR to NL (so Enter works)
+            attrs[0] = attrs[0] | termios.ICRNL
+            # Local flags: canonical mode, kernel echo, signal processing,
+            # extended functions (for backspace/line-edit handling)
+            attrs[3] = attrs[3] | (
+                termios.ICANON | termios.ECHO | termios.ECHOE |
+                termios.ECHOK | termios.IEXTEN | termios.ISIG
+            )
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass
+
 
 async def async_input(prompt: str = "") -> str:
     global _escape_input_handler, _status_display_ref
@@ -47,6 +114,12 @@ async def async_input(prompt: str = "") -> str:
     if handler is not None:
         handler.suspend_listener()
 
+    # Defensive: always ensure terminal is in cooked mode before input().
+    # Even when suspend_listener() runs, it can fail silently if
+    # _saved_settings or _listener_fd is None. This fallback is
+    # idempotent — if the terminal is already cooked, it's a no-op.
+    _ensure_terminal_cooked()
+
     # Pause status display so Rich Live doesn't overwrite the input() prompt
     if status_display is not None:
         try:
@@ -55,8 +128,14 @@ async def async_input(prompt: str = "") -> str:
             pass
 
     try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, input, prompt + "\n> ")
+        # Write prompt and call input() in the main thread (not via
+        # run_in_executor). GNU readline manages its own terminal echo
+        # internally, and its output is only reliable when called from
+        # the main thread. Since we are waiting for user input there is
+        # nothing else the event loop needs to do — blocking is fine.
+        sys.stdout.write(prompt + "\n> ")
+        sys.stdout.flush()
+        result = input()
         return result
 
     finally:
@@ -449,6 +528,78 @@ async def default_can_use_tool(
 
 
 # =============================================================================
+# Tool display formatting
+# =============================================================================
+
+
+def _format_tool_input(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Format tool input for concise terminal display.
+
+    Shows the most relevant fields for each tool type, truncated
+    to keep output readable.
+
+    Args:
+        tool_name: Name of the tool
+        tool_input: Tool input dictionary
+
+    Returns:
+        Formatted string for display, or empty string if no relevant fields
+    """
+    MAX_LEN = 500
+
+    # Tool-specific formatting: show the most important field first
+    key_fields = {
+        "Bash": ["command", "description"],
+        "Read": ["file_path"],
+        "Write": ["file_path"],
+        "Edit": ["file_path"],
+        "Glob": ["pattern"],
+        "Grep": ["pattern", "path"],
+        "Agent": ["prompt"],
+        "AskUserQuestion": [],  # Questions are shown interactively later
+        "TaskCreate": ["subject"],
+        "TaskUpdate": ["taskId", "status"],
+        "TaskList": [],
+        "TaskGet": ["taskId"],
+        "TaskStop": ["taskId"],
+        "EnterPlanMode": [],
+        "ExitPlanMode": [],
+        "TeamCreate": ["team_name"],
+        "TeamDelete": [],
+        "SendMessage": ["to", "summary"],
+        "EnterWorktree": ["name"],
+        "ExitWorktree": ["action"],
+    }
+
+    fields = key_fields.get(tool_name, [])
+
+    if not fields and not tool_input:
+        return ""
+
+    parts = []
+    for key in fields:
+        val = tool_input.get(key)
+        if val is not None:
+            val_str = str(val)
+            if len(val_str) > MAX_LEN:
+                val_str = val_str[:MAX_LEN] + "..."
+            parts.append(f"{key}={val_str}")
+
+    # If no key fields matched, show all fields briefly
+    if not parts:
+        for key, val in tool_input.items():
+            val_str = str(val)
+            if len(val_str) > 80:
+                val_str = val_str[:80] + "..."
+            parts.append(f"{key}={val_str}")
+
+    result = " | ".join(parts)
+    if len(result) > MAX_LEN:
+        result = result[:MAX_LEN] + "..."
+    return result
+
+
+# =============================================================================
 # REPL Mode
 # =============================================================================
 
@@ -510,6 +661,11 @@ class REPL:
         # Escape-aware input handler
         from claude_code_py.ui.escape_input import EscapeInput
         self._escape_input = EscapeInput(self._console)
+
+        # Capture cooked terminal settings BEFORE any raw-mode listener
+        # is started. This provides a known-good baseline that
+        # _ensure_terminal_cooked() can restore to.
+        _capture_cooked_settings()
 
         # Set global reference for async_input to pause/resume listener
         # and to reuse the shared PromptSession for permission prompts.
@@ -1149,7 +1305,11 @@ class REPL:
                                     pass
                                 elif block_type == "tool_use":
                                     tool_name = block.get("name", "unknown")
+                                    tool_input = block.get("input", {})
+                                    tool_desc = _format_tool_input(tool_name, tool_input)
                                     self._console.print(f"\n[dim]⟳ Using tool: {tool_name}[/dim]")
+                                    if tool_desc:
+                                        self._console.print(f"[dim]  {tool_desc}[/dim]")
                     elif event.type == "progress":
                         progress_content = getattr(event, "content", "")
                         if progress_content:
@@ -1263,7 +1423,11 @@ class REPL:
                                     pass
                                 elif block_type == "tool_use":
                                     tool_name = block.get("name", "unknown")
+                                    tool_input = block.get("input", {})
+                                    tool_desc = _format_tool_input(tool_name, tool_input)
                                     self._console.print(f"\n[dim]⟳ Using tool: {tool_name}[/dim]")
+                                    if tool_desc:
+                                        self._console.print(f"[dim]  {tool_desc}[/dim]")
                     elif event.type == "progress":
                         progress_content = getattr(event, "content", "")
                         if progress_content:

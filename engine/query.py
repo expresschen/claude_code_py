@@ -261,6 +261,11 @@ async def query(
             async for event in _handle_context_overflow(params, state, str(e)):
                 yield event
             continue
+        except MaxOutputTokensError as e:
+            # Handle max_tokens exceeded - retry with larger output limit
+            async for event in _handle_max_tokens_exceeded(params, state):
+                yield event
+            continue
         except Exception as e:
             yield create_error_message(str(e))
             break
@@ -651,6 +656,51 @@ async def _handle_context_overflow(
         yield create_error_message("Unable to recover from context overflow")
 
 
+async def _handle_max_tokens_exceeded(
+    params: QueryParams,
+    state: State,
+) -> AsyncGenerator[Union[Message, Any], None]:
+    """Handle max_tokens exceeded error with recovery attempts.
+
+    Recovery strategy (matching TypeScript):
+    1. First attempt: retry with 64k output tokens
+    2. Up to 3 recovery iterations with meta messages telling model to resume
+    3. After exhaustion, surface the error
+
+    Args:
+        params: Query parameters
+        state: Mutable state
+
+    Yields:
+        Messages from recovery attempt
+    """
+    max_attempts = MaxOutputTokensError.MAX_RECOVERY_ATTEMPTS
+
+    if state.max_output_tokens_recovery_count >= max_attempts:
+        yield create_error_message(
+            "Max output tokens exceeded. Unable to recover after "
+            f"{max_attempts} attempts."
+        )
+        return
+
+    state.max_output_tokens_recovery_count += 1
+    state.max_output_tokens_override = MaxOutputTokensError.RECOVERY_MAX_TOKENS
+
+    # Add meta message telling model to resume mid-thought
+    meta_msg = UserMessage(
+        message={
+            "role": "user",
+            "content": (
+                "Your previous response was cut off because it exceeded the "
+                "maximum output token limit. Please continue your response "
+                "from where you left off. Do not repeat what you already said."
+            ),
+        }
+    )
+    state.messages.append(meta_msg)
+    yield meta_msg
+
+
 async def _process_iteration(
     params: QueryParams,
     state: State,
@@ -700,6 +750,7 @@ async def _process_iteration(
         thinking_config=params.tool_use_context.options.thinking_config,
         max_output_tokens_override=params.max_output_tokens_override,
         abort_controller=params.tool_use_context.abort_controller,
+        fallback_model=params.fallback_model,
     )
 
     # Debug: Log assistant response (only for team-lead)
@@ -757,6 +808,7 @@ async def _call_api(
     thinking_config: Optional[Any] = None,
     max_output_tokens_override: Optional[int] = None,
     abort_controller: Optional[Any] = None,
+    fallback_model: Optional[str] = None,
 ) -> AssistantMessage:
     """Call the API using the configured endpoint.
 
@@ -967,33 +1019,63 @@ I cannot process your request without a valid API connection."""
     if thinking_param is not None:
         api_params["thinking"] = thinking_param
 
-    # Make API call with abort support
+    # Make API call with abort support and retry logic
     import asyncio
+    from claude_code_py.utils.retry import (
+        with_retry,
+        RetryOptions,
+        RetryContext,
+        CannotRetryError,
+        FallbackTriggeredError,
+        classify_api_error,
+    )
 
-    async def make_api_call():
-        return await client.messages.create(**api_params)
+    async def make_api_call(attempt: int, context: RetryContext) -> Any:
+        """Make a single API call attempt."""
+        # Use max_tokens_override from retry context if set
+        if context.max_tokens_override:
+            api_params["max_tokens"] = context.max_tokens_override
 
-    # Create task for API call
-    api_task = asyncio.create_task(make_api_call())
+        api_task = asyncio.create_task(client.messages.create(**api_params))
 
-    # Poll for completion or abort
-    while not api_task.done():
-        # Check abort controller
-        if abort_controller and abort_controller.signal.aborted:
-            api_task.cancel()
-            try:
-                await api_task
-            except asyncio.CancelledError:
-                pass
-            raise AbortError("API call aborted by user")
+        # Poll for completion or abort
+        while not api_task.done():
+            if abort_controller and abort_controller.signal.aborted:
+                api_task.cancel()
+                try:
+                    await api_task
+                except asyncio.CancelledError:
+                    pass
+                raise AbortError("API call aborted by user")
 
-        await asyncio.sleep(0.05)  # Check every 50ms for faster response
+            await asyncio.sleep(0.05)
 
-    # Get result
+        try:
+            return api_task.result()
+        except asyncio.CancelledError:
+            raise AbortError("API call cancelled")
+
+    # Build retry options
+    retry_opts = RetryOptions(
+        max_retries=10,
+        model=model,
+        signal=abort_controller.signal if abort_controller else None,
+        query_source=query_source,
+        fallback_model=fallback_model,
+        thinking_config=thinking_config,
+    )
+
     try:
-        response = api_task.result()
-    except asyncio.CancelledError:
-        raise AbortError("API call cancelled")
+        response = await with_retry(make_api_call, retry_opts)
+    except CannotRetryError as e:
+        # All retries exhausted - raise to be caught by query loop
+        logger.error(f"API call failed after retries: {classify_api_error(e.original_error)}")
+        raise e.original_error
+    except FallbackTriggeredError as e:
+        # Model fallback triggered by consecutive 529s
+        logger.warning(f"Model fallback: {e.primary_model} -> {e.fallback_model}")
+        # TODO: Implement model fallback in query loop
+        raise
 
     # Debug: Log full API response (only for team-lead)
     if team_name and is_team_lead():
@@ -1024,6 +1106,13 @@ I cannot process your request without a valid API connection."""
     # Mark tools sent to API after successful response (cached MC)
     if use_cached_mc:
         mark_tools_sent_to_api_state()
+
+    # Check for max_tokens exceeded (stop_reason == "max_tokens")
+    # This means the model hit the output token limit before completing
+    if hasattr(response, "stop_reason") and response.stop_reason == "max_tokens":
+        raise MaxOutputTokensError(
+            f"Response exceeded max_tokens limit ({max_tokens})"
+        )
 
     # Build assistant message
     content_blocks = []
@@ -1186,3 +1275,20 @@ class ContextLengthError(Exception):
     def __init__(self, message: str = "context_length_exceeded"):
         super().__init__(message)
         self.error_type = "context_length_exceeded"
+
+
+class MaxOutputTokensError(Exception):
+    """Exception for max_tokens exceeded errors.
+
+    The model hit the output token limit before completing its response.
+    Recovery: retry with a larger max_tokens and add a meta message
+    telling the model to resume mid-thought.
+    """
+
+    MAX_RECOVERY_ATTEMPTS = 3
+    # Default max output tokens for recovery (matching TypeScript)
+    RECOVERY_MAX_TOKENS = 64000
+
+    def __init__(self, message: str = "max_tokens_exceeded"):
+        super().__init__(message)
+        self.error_type = "max_tokens_exceeded"

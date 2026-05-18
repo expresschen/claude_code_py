@@ -28,6 +28,18 @@ class EscapeInput:
         self._listener_fd: Optional[int] = None
         self._saved_settings: Optional[list] = None
 
+        # Capture initial cooked settings as a safety fallback for
+        # _restore_saved_settings(). If _saved_settings gets lost due to
+        # an edge case, we can fall back to these initial settings so the
+        # terminal is never left in raw mode during input().
+        try:
+            if sys.stdin.isatty():
+                self._initial_settings: Optional[list] = termios.tcgetattr(sys.stdin.fileno())
+            else:
+                self._initial_settings = None
+        except Exception:
+            self._initial_settings = None
+
         self._on_escape: Optional[Callable] = None
         self._on_ctrl_c: Optional[Callable] = None
 
@@ -173,11 +185,15 @@ class EscapeInput:
             pass
 
     def _restore_saved_settings(self) -> None:
-        if self._listener_fd is not None and self._saved_settings is not None:
+        settings = None
+        fd = self._listener_fd
+        if fd is not None and self._saved_settings is not None:
+            settings = self._saved_settings
+        elif fd is not None and self._initial_settings is not None:
+            settings = self._initial_settings
+        if settings is not None:
             try:
-                termios.tcsetattr(
-                    self._listener_fd, termios.TCSADRAIN, self._saved_settings
-                )
+                termios.tcsetattr(fd, termios.TCSADRAIN, settings)
             except Exception:
                 pass
 
